@@ -917,3 +917,23 @@ test("a failed or oversized screenshot never blocks the teardown", async () => {
     assert.match(claudeReply.last.body.messages[0].content, /There is no screenshot/);
   }
 });
+
+test("a scheduled limit change takes over on its date, and a manual change cancels it", async () => {
+  const { getSettings, saveSettings } = await import("../src/leads.js");
+  const db = fakeD1();
+  await saveSettings(db, { dailyLimit: 25 });
+  await db.prepare(`INSERT INTO settings (key, value) VALUES ('scheduledLimit', '10'), ('scheduledLimitFrom', '2026-11-13T05:00:00Z')`).run();
+
+  const before = await getSettings(db, new Date("2026-11-13T04:59:00Z"));
+  assert.equal(before.dailyLimit, 25);
+  assert.deepEqual(before.upcoming, { dailyLimit: 10, from: "2026-11-13T05:00:00Z" });
+  const after = await getSettings(db, new Date("2026-11-13T05:00:00Z"));
+  assert.equal(after.dailyLimit, 10);
+  assert.equal(after.upcoming, undefined);
+
+  const env = { DB: db, ADMIN_USERS: USERS };
+  assert.match(await (await admin(env, "/teardown/admin")).text(), /The daily limit changes to 10 on Nov 13\./);
+
+  await saveSettings(db, { dailyLimit: 7 });
+  assert.equal((await getSettings(db, new Date("2026-12-01T00:00:00Z"))).dailyLimit, 7);
+});

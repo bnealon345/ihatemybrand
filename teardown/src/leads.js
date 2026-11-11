@@ -197,15 +197,25 @@ export async function deleteLead(db, id) {
   return (res?.meta?.changes ?? 0) > 0;
 }
 
-export async function getSettings(db) {
+export async function getSettings(db, now = new Date()) {
   await ensureSchema(db);
   const out = { ...DEFAULT_SETTINGS };
+  const validLimit = (value) => {
+    const n = parseInt(value, 10);
+    return Number.isInteger(n) && n >= 1 && n <= 100 ? n : null;
+  };
+  let nextLimit = null;
+  let nextFrom = null;
   for (const row of (await db.prepare(`SELECT key, value FROM settings`).all()).results || []) {
     if (row.key === "paused") out.paused = row.value === "1";
-    if (row.key === "dailyLimit") {
-      const n = parseInt(row.value, 10);
-      if (Number.isInteger(n) && n >= 1 && n <= 100) out.dailyLimit = n;
-    }
+    if (row.key === "dailyLimit") out.dailyLimit = validLimit(row.value) ?? out.dailyLimit;
+    if (row.key === "scheduledLimit") nextLimit = validLimit(row.value);
+    if (row.key === "scheduledLimitFrom") nextFrom = row.value;
+  }
+  // A limit change set for a future date. Takes over from that moment; until then it is shown as upcoming.
+  if (nextLimit && nextFrom && !Number.isNaN(Date.parse(nextFrom))) {
+    if (now.getTime() >= Date.parse(nextFrom)) out.dailyLimit = nextLimit;
+    else out.upcoming = { dailyLimit: nextLimit, from: nextFrom };
   }
   return out;
 }
@@ -219,6 +229,8 @@ export async function saveSettings(db, changes) {
     const n = Number(changes.dailyLimit);
     if (!Number.isInteger(n) || n < 1 || n > 100) throw new RangeError("The daily limit must be a whole number from 1 to 100.");
     await put("dailyLimit", String(n));
+    // Setting the limit by hand replaces any change that was scheduled.
+    await db.prepare(`DELETE FROM settings WHERE key IN ('scheduledLimit', 'scheduledLimitFrom')`).run();
   }
   return getSettings(db);
 }

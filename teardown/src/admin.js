@@ -313,7 +313,7 @@ ${adminNav("leads")}
   <div><h2 style="margin:0">Teardown controls</h2></div>
   <label><input type="checkbox" id="paused"${settings.paused ? " checked" : ""}> Pause new teardowns</label>
   <label>Free teardowns per visitor per day <input type="number" id="dailyLimit" min="1" max="100" value="${settings.dailyLimit}"></label>
-  <span class="muted">${settings.paused ? "Paused. Visitors see a “check back soon” message and nothing is spent on audits." : "Live."}${hasCache ? "" : " The daily limit needs the cache turned on (see README)."}</span>
+  <span class="muted">${settings.paused ? "Paused. Visitors see a “check back soon” message and nothing is spent on audits." : "Live."}${hasCache ? "" : " The daily limit needs the cache turned on (see README)."}${settings.upcoming ? ` The daily limit changes to ${settings.upcoming.dailyLimit} on ${esc(new Date(settings.upcoming.from).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "America/New_York" }))}. Changing the number here cancels that.` : ""}</span>
 </div>
 
 <nav class="tabs" aria-label="Filter by stage">
