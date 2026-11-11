@@ -232,7 +232,8 @@ test("end to end: URL in, free note out, then served from cache", async () => {
 
   const sent = claudeReply.last;
   assert.equal(sent.headers["x-api-key"], "sk-test");
-  assert.equal(sent.body.tool_choice.name, "free_note");
+  assert.deepEqual(sent.body.tool_choice, { type: "auto" });
+  assert.equal(sent.body.tools[0].name, "free_note");
   assert.match(sent.body.system, /brand auditor for I Hate Social/);
   assert.match(sent.body.messages[0].content, /MODE: FREE[\s\S]*Empowering Tomorrow/);
 
@@ -791,4 +792,13 @@ test("homepage additions are applied to the real markup", async () => {
   } finally {
     delete globalThis.HTMLRewriter;
   }
+});
+
+test("accepts a JSON answer when the model replies in text instead of calling the tool", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test" };
+  const asText = (text) => () => Response.json({ content: [{ type: "text", text }] });
+  let res = await withNet(acmeNet(asText("Here you go:\n```json\n" + JSON.stringify(GOOD_NOTE) + "\n```")), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal((await res.json()).note.problem, GOOD_NOTE.problem);
+  res = await withNet(acmeNet(asText("Your headline is weak. Fix it.")), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal(res.status, 502, "free text with no structure is not shown as an audit");
 });
