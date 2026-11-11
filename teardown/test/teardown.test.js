@@ -306,8 +306,8 @@ test("limits free audits per IP per day", async () => {
 test("serves the page and helpers", async () => {
   const env = { ASSETS: { fetch: async () => new Response("page") } };
   assert.equal(await (await worker.fetch(new Request("https://x.com/teardown/"), env, {})).text(), "page");
-  const root = await worker.fetch(new Request("https://x.com/"), env, {});
-  assert.equal(root.headers.get("location"), "https://x.com/teardown/");
+  const local = await worker.fetch(new Request("http://localhost/"), env, {});
+  assert.equal(local.headers.get("location"), "http://localhost/teardown/");
   assert.equal(domainOf("https://WWW.Acme.com/pricing"), "acme.com");
 });
 
@@ -741,4 +741,54 @@ test("tries a draft prompt without saving it or creating a lead", async () => {
   assert.equal(blocked.status, 400, "the same address rules apply to admins");
   const escaped = await (await admin(env, "/teardown/admin/prompt")).text();
   assert.doesNotMatch(escaped, /<textarea[^>]*>[^<]*<script/);
+});
+
+// ---------- homepage ----------
+
+test("homepage comes from the main site and is passed through untouched when it isn't a normal page", async () => {
+  const asked = [];
+  const site = (res) => ({ SITE: { fetch: async (req) => { asked.push(new URL(req.url).pathname + ":" + req.method); return res(); } } });
+
+  // No HTMLRewriter in Node, which is the same path as "can't rewrite": the main site's page is served as is.
+  let res = await worker.fetch(new Request("https://ihatemybrand.com/"), site(() => html("<h1>real site</h1>")), {});
+  assert.equal(await res.text(), "<h1>real site</h1>");
+
+  res = await worker.fetch(new Request("https://ihatemybrand.com/"), site(() => new Response("down", { status: 503 })), {});
+  assert.equal(res.status, 503);
+  res = await worker.fetch(new Request("https://ihatemybrand.com/", { method: "POST", body: "x" }), site(() => html("ok")), {});
+  assert.equal(await res.text(), "ok");
+
+  await worker.fetch(new Request("https://ihatemybrand.com/teardown/preview-home"), site(() => html("x")), {});
+  assert.deepEqual(asked, ["/:GET", "/:GET", "/:POST", "/:GET"], "the preview asks the main site for its homepage");
+});
+
+test("homepage additions are applied to the real markup", async () => {
+  const calls = [];
+  globalThis.HTMLRewriter = class {
+    on(selector, handlers) { calls.push([selector, handlers]); return this; }
+    transform(res) { return new Response("rewritten", { headers: res.headers }); }
+  };
+  try {
+    const env = { SITE: { fetch: async () => html("<html></html>") } };
+    const res = await worker.fetch(new Request("https://ihatemybrand.com/teardown/preview-home"), env, {});
+    assert.equal(await res.text(), "rewritten");
+    assert.equal(res.headers.get("x-robots-tag"), "noindex, nofollow");
+    assert.deepEqual(calls.map((c) => c[0]), ["head", "header nav a.btn", "section.hero h1", "section.hero"]);
+
+    const added = {};
+    for (const [selector, handlers] of calls) {
+      const record = (how) => (content, opts) => { added[selector] = { how, content, html: opts?.html }; };
+      handlers.element({ append: record("append"), before: record("before"), prepend: record("prepend"), after: record("after") });
+    }
+    assert.equal(added["header nav a.btn"].how, "before");
+    assert.match(added["header nav a.btn"].content, /href="\/teardown\/">Free teardown/);
+    assert.equal(added["section.hero h1"].how, "prepend");
+    assert.match(added["section.hero h1"].content, /class="ihmb-thumb"[\s\S]*class="thumb"/);
+    assert.equal(added["section.hero"].how, "after");
+    assert.match(added["section.hero"].content, /<form action="\/teardown\/" method="get">[\s\S]*name="url"/);
+    assert.match(added["head"].content, /h1:has\(\.swap\.hov:hover\) \.ihmb-thumb \.thumb\{transform:rotate\(180deg\)\}/);
+    assert.ok(Object.values(added).every((a) => a.html === true));
+  } finally {
+    delete globalThis.HTMLRewriter;
+  }
 });

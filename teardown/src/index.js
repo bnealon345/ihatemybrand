@@ -4,6 +4,7 @@
 //   POST /teardown/api/audit   { "url": "yourbrand.com" }        ->  { ok, leadId, domain, note }
 //   POST /teardown/api/email   { "leadId": "...", "email": "" }  ->  { ok }
 //   GET  /teardown/admin       private leads table (and /teardown/admin/leads.csv)
+//   GET  /                     the main site's homepage with the teardown band added (see home.js)
 //   everything else            static files from ./public
 
 import { TeardownError, normalizeUrl, safeFetchPage } from "./safe-fetch.js";
@@ -11,6 +12,7 @@ import { extractPage, extractContacts, mergeContacts, hasTooLittleContent } from
 import { runFreeAudit } from "./audit.js";
 import { insertLead, updateContacts, saveVisitorEmail, getSettings, getActivePrompt, DEFAULT_SETTINGS } from "./leads.js";
 import { handleAdmin } from "./admin.js";
+import { serveHome } from "./home.js";
 
 const CACHE_TTL_SECONDS = 24 * 60 * 60;
 const EMAIL_SAVES_PER_IP_PER_DAY = 20;
@@ -220,7 +222,9 @@ export default {
       }
     }
 
-    if (pathname === "/") return Response.redirect(new URL("/teardown/", request.url).toString(), 302);
+    // The main site's homepage, with the teardown entry points added on the way through.
+    if (pathname === "/") return serveHome(request, env);
+    if (pathname === "/teardown/preview-home") return serveHome(request, env, { preview: true });
     return env.ASSETS.fetch(request);
   },
 };
