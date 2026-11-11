@@ -18,12 +18,16 @@
 
 import {
   STAGES, listLeads, leadStats, updateLead, deleteLead, deleteLeads, getLead, insertLead, getSettings, saveSettings, parseList, toCsv,
+  listEvents, logEvent,
   getActivePrompt, savePrompt, listPromptVersions, PROMPT_MAX,
 } from "./leads.js";
 import { AUDITOR_PROMPT, runFreeAudit } from "./audit.js";
 import { TeardownError, normalizeUrl, safeFetchPage } from "./safe-fetch.js";
 import { extractPage, extractContacts, hasTooLittleContent } from "./extract.js";
 import { takeScreenshot, saveScreenshot } from "./shot.js";
+import { parseAnalysis, scoreRow, scoreAndAlert } from "./followup.js";
+import { buildAlert, sendAlert, parseRecipients } from "./notify.js";
+import { scoreLabel } from "./analysis.js";
 
 const PRIVATE_HEADERS = { "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" };
 const STAGE_LABELS = {
@@ -125,32 +129,34 @@ function hostLabel(url) {
 }
 
 /** A ready-to-send email in the person's own mail app. Nothing is sent from here. */
-export function outreachMailto(row, sender) {
-  const to = row.visitor_email || parseList(row.site_emails)[0];
-  if (!to || !row.note_problem || row.stage === "do_not_contact") return null;
+export function outreachDraft(row, sender, analysis = parseAnalysis(row)) {
+  const to = row.visitor_email || parseList(row.site_emails)[0] || "";
+  if (!row.note_problem) return null;
+  if (analysis?.outreachBody) {
+    return { to, subject: analysis.outreachSubject || `The biggest problem with ${row.domain}`, body: analysis.outreachBody.replace(/\[Your name\]/gi, cap(sender)), ai: true };
+  }
   const opener = row.visitor_email
     ? `You ran ${row.domain} through our free Brand Teardown. Here's the note again, in case it got lost:`
     : `Someone ran ${row.domain} through our free Brand Teardown at ihatemybrand.com. This is the biggest thing it flagged:`;
   const body = [
-    "Hi,",
-    "",
-    opener,
-    "",
-    clip(row.note_problem, 240),
-    "",
-    clip(row.note_why, 420),
-    "",
-    "The fix: " + clip(row.note_fix, 520),
-    "",
-    `If you'd rather have us handle it, our flat prices are at ${SITE}. No calls, done in days.`,
-    "",
-    "Not interested? Reply and say so, and we won't email again.",
-    "",
-    cap(sender),
-    "I Hate My Brand",
+    "Hi,", "", opener, "", clip(row.note_problem, 240), "", clip(row.note_why, 420), "", "The fix: " + clip(row.note_fix, 520), "",
+    `If you'd rather have us handle it, our flat prices are at ${SITE}. No calls, done in days.`, "",
+    "Not interested? Reply and say so, and we won't email again.", "", cap(sender), "I Hate My Brand",
   ].join("\n");
-  const subject = `The biggest problem with ${row.domain}`;
-  return `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return { to, subject: `The biggest problem with ${row.domain}`, body, ai: false };
+}
+
+/** A ready-to-send email in the person's own mail app. Nothing is sent from here. */
+export function outreachMailto(row, sender) {
+  const draft = outreachDraft(row, sender);
+  if (!draft || !draft.to || row.stage === "do_not_contact") return null;
+  return `mailto:${encodeURIComponent(draft.to)}?subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(clip(draft.body, 1400))}`;
+}
+
+function scoreBadge(row) {
+  if (row.lead_score === null || row.lead_score === undefined) return "";
+  const label = scoreLabel(row.lead_score);
+  return `<span class="score ${label.toLowerCase()}" title="Lead score">${esc(row.lead_score)} ${label}</span>`;
 }
 
 function queryString(filters, changes = {}) {
@@ -160,6 +166,8 @@ function queryString(filters, changes = {}) {
   if (merged.q) params.set("q", merged.q);
   if (merged.reachable) params.set("reachable", "1");
   if (merged.tests) params.set("tests", "1");
+  if (merged.due) params.set("due", "1");
+  if (merged.sort) params.set("sort", merged.sort);
   const s = params.toString();
   return s ? "?" + s : "";
 }
@@ -229,6 +237,29 @@ const CSS = `
   .versions { list-style: none; margin: 0; padding: 0; }
   .versions li { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid #27385b; }
   .versions li:first-child { border-top: 0; }
+  .score { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .04em; border-radius: 999px; padding: 3px 10px; margin-bottom: 6px; border: 1px solid #5b6c8f; color: #f4f5f7; }
+  .score.hot { background: #e4ec66; color: #0b1a33; border-color: #e4ec66; }
+  .score.warm { border-color: #e4ec66; color: #e4ec66; }
+  .follow { display: block; }
+  input[type="date"] { font: inherit; color: #f4f5f7; background: #0f2140; border: 1px solid #3a4c72; border-radius: 8px; padding: 6px 8px; margin-top: 4px; width: 100%; color-scheme: dark; }
+  .funnel { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-bottom: 18px; }
+  .funnel div { border: 1px solid #27385b; border-radius: 10px; padding: 8px 12px; }
+  .funnel b { font-size: 18px; margin-right: 6px; }
+  .funnel i { font-style: normal; color: #b4c3de; font-size: 13px; }
+  .funnel span { color: #5b6c8f; }
+  .bignum { font-size: 44px; font-weight: 800; line-height: 1; }
+  .meter { display: flex; gap: 14px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .meter div { flex: 1 1 120px; border: 1px solid #27385b; border-radius: 10px; padding: 10px 12px; }
+  .meter b { display: block; font-size: 26px; line-height: 1.1; }
+  .parts { list-style: none; margin: 10px 0 0; padding: 0; }
+  .parts li { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-top: 1px solid #27385b; font-size: 14px; }
+  #draftbody { min-height: 260px; }
+  .trail { list-style: none; margin: 0; padding: 0; }
+  .trail li { padding: 9px 0; border-top: 1px solid #27385b; }
+  .trail li:first-child { border-top: 0; }
+  .trail time { display: block; }
+  .addnote { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .addnote input { flex: 1 1 200px; width: auto; }
   .thumb { display: block; width: 120px; height: auto; margin-top: 8px; border-radius: 6px; border: 1px solid #27385b; }
   .headline { display: block; color: #f4f5f7; font-weight: 600; text-decoration: none; margin-bottom: 4px; }
   .headline:hover { text-decoration: underline; }
@@ -296,6 +327,10 @@ const SCRIPT = `
       send("lead", body).then(function () { say("Saved"); }).catch(function (err) { say(err.message, true); });
       return;
     }
+    if (e.target.id === "alertTo") {
+      send("settings", { alertTo: e.target.value }).then(function () { say("Saved"); }).catch(function (err) { say(err.message, true); });
+      return;
+    }
     if (e.target.id === "paused" || e.target.id === "dailyLimit") {
       var change = e.target.id === "paused" ? { paused: e.target.checked } : { dailyLimit: Number(e.target.value) };
       send("settings", change).then(function () { say("Saved"); setTimeout(function () { location.reload(); }, 500); })
@@ -318,7 +353,32 @@ const SCRIPT = `
         .catch(function (err) { button.disabled = false; status.textContent = was; say(err.message, true); });
       return;
     }
-    var action = e.target.getAttribute("data-action"), row = e.target.closest("[data-id]");
+    if (e.target.id === "testalert") {
+      e.target.disabled = true;
+      send("test-alert", {}).then(function (d) { say(d.message); }).catch(function (err) { say(err.message, true); })
+        .then(function () { e.target.disabled = false; });
+      return;
+    }
+    var holder = e.target.closest("[data-id]");
+    if (e.target.id === "addnote" || e.target.id === "logreply") {
+      var input = document.getElementById("notetext"), isReply = e.target.id === "logreply";
+      if (!isReply && !input.value.trim()) { say("Type something first.", true); return; }
+      send("event", { id: holder.getAttribute("data-id"), type: isReply ? "reply" : "note", detail: input.value })
+        .then(function () { location.reload(); }).catch(function (err) { say(err.message, true); });
+      return;
+    }
+    if (e.target.id === "copydraft") {
+      var text = document.getElementById("draftbody").value;
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(function () { say("Copied"); }, function () { say("Couldn't copy. Select the text and copy it by hand.", true); });
+      return;
+    }
+    if (e.target.id === "openmail") {
+      var to = document.getElementById("draftto").value.trim();
+      if (!to) { e.preventDefault(); say("Add an email address in the To box first.", true); return; }
+      e.target.href = "mailto:" + encodeURIComponent(to) + "?subject=" + encodeURIComponent(document.getElementById("draftsubject").value)
+        + "&body=" + encodeURIComponent(document.getElementById("draftbody").value.slice(0, 1800));
+    }
+    var action = e.target.getAttribute("data-action"), row = holder;
     if (!action || !row) return;
     var id = row.getAttribute("data-id");
     if (action === "delete") {
@@ -329,8 +389,9 @@ const SCRIPT = `
       }).catch(function (err) { say(err.message, true); });
     }
     if (action === "email") {
-      // Opening your mail app counts as reaching out: move a new lead to Contacted.
-      var stage = row.querySelector('[data-field="stage"]');
+      // Opening your mail app counts as reaching out: it goes on the trail and a new lead moves to Contacted.
+      send("event", { id: id, type: "outreach" }).catch(function () {});
+      var stage = document.querySelector('[data-id="' + id + '"] [data-field="stage"]');
       if (stage && stage.value === "new") {
         stage.value = "contacted";
         send("lead", { id: id, stage: "contacted" }).then(function () { say("Marked as contacted"); }).catch(function (err) { say(err.message, true); });
@@ -354,6 +415,7 @@ function workControls(row, me, owners) {
     : "";
   return `${stageSelect}
       ${ownerSelect}
+      <label class="muted follow">Follow up on <input type="date" data-field="followUp" value="${esc(row.follow_up || "")}"></label>
       <textarea data-field="notes" rows="2" maxlength="4000" placeholder="Notes" aria-label="Notes for ${esc(row.domain)}">${esc(row.admin_notes)}</textarea>
       <div class="actions">
         ${mailto ? `<a class="btn small" data-action="email" href="${esc(mailto)}">Email them</a>` : ""}
@@ -388,7 +450,7 @@ function renderRow(row, me, owners) {
 
   return `<tr data-id="${esc(row.id)}" data-domain="${esc(row.domain)}">
     <td><input type="checkbox" class="pick" value="${esc(row.id)}" aria-label="Select ${esc(row.domain)}"></td>
-    <td class="nowrap">${esc(String(row.created_at).replace("T", " ").slice(0, 16))}${row.from_cache ? '<div class="muted">repeat site</div>' : ""}</td>
+    <td class="nowrap">${scoreBadge(row)}<div>${esc(String(row.created_at).replace("T", " ").slice(0, 16))}</div>${row.from_cache ? '<div class="muted">repeat site</div>' : ""}${row.follow_up ? `<div class="muted">Follow up ${esc(row.follow_up)}</div>` : ""}</td>
     <td>${safeLink(row.final_url || row.input_url, row.domain)}${row.site_title ? `<div class="muted">${esc(clip(row.site_title, 70))}</div>` : ""}${row.country ? `<div class="muted">Visitor in ${esc(row.country)}</div>` : ""}${thumb}</td>
     <td class="wide">${note}</td>
     <td>${contactBlock(row)}</td>
@@ -415,8 +477,50 @@ function structuredNote(row) {
   };
 }
 
-function renderLeadPage({ row, me, owners }) {
+function renderLeadPage({ row, me, owners, events = [] }) {
   const note = structuredNote(row);
+  const read = parseAnalysis(row);
+  const score = scoreRow(row, read);
+  const draft = outreachDraft(row, me, read);
+  const closed = row.stage === "do_not_contact";
+
+  const scoreCard = `<div class="card"><h2>Lead score</h2>
+      <div class="bignum">${score.score}<span class="score ${score.label.toLowerCase()}" style="margin-left:12px;vertical-align:middle">${score.label}</span></div>
+      <ul class="parts">${score.parts.map((p) => `<li><span>${esc(p.label)}</span><b>+${p.points}</b></li>`).join("") || '<li><span class="muted">Nothing to score yet.</span></li>'}</ul>
+    </div>`;
+
+  const readCard = read
+    ? `<div class="card"><h2>The business, as the AI reads it</h2>
+        <p><b>${esc(read.businessType)}.</b> ${esc(read.businessSummary)}</p>
+        <div class="meter">
+          <div><b>${esc(read.businessScore)}/10</b>How real the business looks${read.businessReasons?.length ? `<ul class="parts">${read.businessReasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}</div>
+          <div><b>${esc(read.brandScore)}/10</b>How strong the brand is now${read.brandReasons?.length ? `<ul class="parts">${read.brandReasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>` : ""}</div>
+        </div>
+        ${read.package ? `<p><b>Pitch: ${esc(read.package)} (${esc(read.packagePrice)}).</b> ${esc(read.packageWhy)}</p>` : ""}
+        <p class="muted">An AI's judgement from their public site only. Treat it as a starting point, not a fact.</p>
+      </div>`
+    : row.note_problem ? '<div class="card"><h2>The business, as the AI reads it</h2><p class="muted">No read on this one. It was made before this feature, or the analysis didn\u2019t finish.</p></div>' : "";
+
+  const draftCard = draft
+    ? `<div class="card"><h2>Outreach draft${draft.ai ? "" : " (standard template)"}</h2>
+        ${closed ? '<p class="muted">Marked Do not contact, so sending is switched off.</p>' : ""}
+        <label class="muted" for="draftto">To</label><input type="text" id="draftto" value="${esc(draft.to)}" placeholder="No address found. Add one." autocapitalize="none" spellcheck="false">
+        <label class="muted" for="draftsubject" style="display:block;margin-top:10px">Subject</label><input type="text" id="draftsubject" value="${esc(draft.subject)}">
+        <label class="muted" for="draftbody" style="display:block;margin-top:10px">Message</label><textarea id="draftbody">${esc(draft.body)}</textarea>
+        <div class="row">
+          ${closed ? "" : '<a class="btn small" id="openmail" data-action="email" href="#">Open in my email</a>'}
+          <button class="btn small ghost" type="button" id="copydraft">Copy message</button>
+          <span class="muted">Edit it first. Nothing is sent from here.</span>
+        </div>
+      </div>`
+    : "";
+
+  const trailCard = `<div class="card"><h2>Activity</h2>
+      <div class="addnote"><input type="text" id="notetext" maxlength="400" placeholder="Add to the trail: called, left voicemail, sent proposal..." aria-label="Add a note to the trail">
+        <button class="btn small" type="button" id="addnote">Add</button>
+        <button class="btn small ghost" type="button" id="logreply">They replied</button></div>
+      <ul class="trail">${events.map((e) => `<li><div>${esc(e.detail || e.type)}</div><time class="muted">${esc(String(e.at).replace("T", " ").slice(0, 16))} UTC \u00b7 ${esc(cap(e.by || "system"))}</time></li>`).join("") || '<li class="muted">Nothing yet.</li>'}</ul>
+    </div>`;
   const when = String(row.created_at).replace("T", " ").slice(0, 16);
   const facts = [
     row.is_test ? "Test run from the back office" : null,
@@ -449,9 +553,15 @@ function renderLeadPage({ row, me, owners }) {
 </div>
 
 <div class="cols">
-  <div class="card lead">${body}</div>
+  <div data-id="${esc(row.id)}" data-domain="${esc(row.domain)}">
+    <div class="card lead">${body}</div>
+    ${draftCard}
+    ${readCard}
+  </div>
   <div data-id="${esc(row.id)}" data-domain="${esc(row.domain)}">
     <div class="card work" style="width:auto"><h2>Working it</h2>${workControls(row, me, owners)}</div>
+    ${scoreCard}
+    ${trailCard}
     <div class="card"><h2>Contact</h2>${contactBlock(row)}</div>
     <div class="card"><h2>Details</h2>${facts.map((f) => `<div class="muted">${f}</div>`).join("")}</div>
   </div>
@@ -465,7 +575,7 @@ function renderLeadPage({ row, me, owners }) {
 
 function renderPage({ rows, stats, settings, filters, me, owners, hasCache }) {
   const tab = (stage, label, count) =>
-    `<a class="tab${!filters.tests && (filters.stage || "") === stage ? " on" : ""}" href="/teardown/admin${queryString({ ...filters, tests: false }, { stage })}">${esc(label)} <span>${count}</span></a>`;
+    `<a class="tab${!filters.tests && !filters.due && (filters.stage || "") === stage ? " on" : ""}" href="/teardown/admin${queryString({ ...filters, tests: false, due: false }, { stage })}">${esc(label)} <span>${count}</span></a>`;
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
@@ -491,11 +601,23 @@ ${adminNav("leads")}
   <div class="stat"><b>${stats.stages.won}</b>won</div>
 </div>
 
+<div class="funnel" aria-label="Funnel">
+  ${[["Teardowns", stats.funnel.teardowns], ["Reachable", stats.funnel.reachable], ["Contacted", stats.funnel.contacted], ["Replied", stats.funnel.replied], ["Won", stats.funnel.won]]
+    .map(([label, n], i) => `${i ? '<span aria-hidden="true">\u2192</span>' : ""}<div><b>${n}</b>${label}${i && stats.funnel.teardowns ? ` <i>${Math.round((n / stats.funnel.teardowns) * 100)}%</i>` : ""}</div>`).join("")}
+</div>
+
 <div class="panel${settings.paused ? " paused" : ""}" id="settings">
   <div><h2 style="margin:0">Teardown controls</h2></div>
   <label><input type="checkbox" id="paused"${settings.paused ? " checked" : ""}> Pause new teardowns</label>
   <label>Free teardowns per visitor per day <input type="number" id="dailyLimit" min="1" max="100" value="${settings.dailyLimit}"></label>
   <span class="muted">${settings.paused ? "Paused. Visitors see a “check back soon” message and nothing is spent on audits." : "Live."}${hasCache ? "" : " The daily limit needs the cache turned on (see README)."}${settings.upcoming ? ` The daily limit changes to ${settings.upcoming.dailyLimit} on ${esc(new Date(settings.upcoming.from).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "America/New_York" }))}. Changing the number here cancels that.` : ""}</span>
+</div>
+
+<div class="panel">
+  <div><h2 style="margin:0">Lead alerts</h2></div>
+  <label style="flex:1 1 320px">Email <input type="text" id="alertTo" value="${esc(settings.alertTo)}" placeholder="you@example.com, partner@example.com" autocapitalize="none" spellcheck="false" style="width:auto;flex:1"></label>
+  <button class="btn small ghost" type="button" id="testalert">Send a test alert</button>
+  <span class="muted">An email goes out when a teardown is run and again if the visitor leaves their email. Addresses must be verified in Cloudflare Email Routing.</span>
 </div>
 
 <div class="panel">
@@ -508,17 +630,21 @@ ${adminNav("leads")}
 <nav class="tabs" aria-label="Filter by stage">
   ${tab("", "All", stats.total)}
   ${STAGES.map((s) => tab(s, STAGE_LABELS[s], stats.stages[s])).join("")}
+  <a class="tab${filters.due ? " on" : ""}" href="/teardown/admin?due=1">Follow-ups due <span>${stats.due}</span></a>
   <a class="tab${filters.tests ? " on" : ""}" href="/teardown/admin?tests=1">Tests <span>${stats.tests}</span></a>
 </nav>
 
 <form class="tools" method="get" action="/teardown/admin">
   ${filters.stage ? `<input type="hidden" name="stage" value="${esc(filters.stage)}">` : ""}
   ${filters.tests ? '<input type="hidden" name="tests" value="1">' : ""}
+  ${filters.due ? '<input type="hidden" name="due" value="1">' : ""}
+  ${filters.sort ? `<input type="hidden" name="sort" value="${esc(filters.sort)}">` : ""}
   <input type="search" name="q" value="${esc(filters.q)}" placeholder="Search site, email, note" aria-label="Search leads">
   <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="reachable" value="1"${filters.reachable ? " checked" : ""}> Only leads we can reach</label>
   <button class="btn small" type="submit">Filter</button>
   ${filters.q || filters.reachable ? `<a href="/teardown/admin${queryString({ stage: filters.stage })}">Clear</a>` : ""}
   <span class="muted">${rows.length} shown</span>
+  ${filters.sort === "score" ? `<a href="/teardown/admin${queryString(filters, { sort: "" })}">Newest first</a>` : `<a href="/teardown/admin${queryString(filters, { sort: "score" })}">Highest score first</a>`}
   <button class="btn small ghost" id="bulkdelete" type="button" hidden></button>
 </form>
 
@@ -660,7 +786,7 @@ async function tryPrompt(env, body) {
 }
 
 // A full teardown run by Ned or Brian: same steps as a visitor's, no daily limit, filed under Tests.
-async function testRun(env, body) {
+async function testRun(env, body, me) {
   if (!env.ANTHROPIC_API_KEY) return json({ ok: false, error: "The Claude API key isn't set yet." }, 503);
   try {
     const fetched = await safeFetchPage(normalizeUrl(body?.url));
@@ -677,6 +803,8 @@ async function testRun(env, body) {
       status: "ok", note, contacts: extractContacts(fetched.html, fetched.finalUrl), socialLinks: page.socialLinks,
       siteTitle: page.title, promptVersion: active.version, shotId: savedShot ? id : null, isTest: true,
     });
+    await logEvent(env.DB, id, "created", `Test run on ${new URL(fetched.finalUrl).hostname}`, me);
+    await scoreAndAlert(env, id, { page, note });
     return json({ ok: true, id });
   } catch (err) {
     if (err instanceof TeardownError) return json({ ok: false, error: err.message }, err.status);
@@ -711,7 +839,7 @@ async function handleAction(request, env, pathname, me) {
   try {
     if (pathname === "/teardown/admin/api/lead") {
       if (!validId) return json({ ok: false, error: "Unknown lead." }, 400);
-      const found = await updateLead(env.DB, id, { stage: body.stage, owner: body.owner, notes: body.notes }, me);
+      const found = await updateLead(env.DB, id, { stage: body.stage, owner: body.owner, notes: body.notes, followUp: body.followUp }, me);
       return found ? json({ ok: true }) : json({ ok: false, error: "That lead no longer exists." }, 404);
     }
     if (pathname === "/teardown/admin/api/delete") {
@@ -719,11 +847,36 @@ async function handleAction(request, env, pathname, me) {
       const found = await deleteLead(env.DB, id);
       return found ? json({ ok: true }) : json({ ok: false, error: "That lead no longer exists." }, 404);
     }
+    if (pathname === "/teardown/admin/api/event") {
+      const lead = validId ? await getLead(env.DB, id) : null;
+      if (!lead) return json({ ok: false, error: "That lead no longer exists." }, 404);
+      const detail = String(body?.detail || "").trim().slice(0, 400);
+      if (body?.type === "note") {
+        if (!detail) return json({ ok: false, error: "Type something first." }, 400);
+        await logEvent(env.DB, id, "note", detail, me);
+      } else if (body?.type === "reply") {
+        await logEvent(env.DB, id, "reply", detail ? `They replied: ${detail}` : "They replied", me);
+        if (lead.stage === "new" || lead.stage === "contacted") await updateLead(env.DB, id, { stage: "replied" }, me);
+      } else if (body?.type === "outreach") {
+        await logEvent(env.DB, id, "outreach", "Opened an outreach email in their mail app", me);
+      } else {
+        return json({ ok: false, error: "Bad request." }, 400);
+      }
+      return json({ ok: true });
+    }
+    if (pathname === "/teardown/admin/api/test-alert") {
+      const settings = await getSettings(env.DB);
+      if (!parseRecipients(settings.alertTo).length) return json({ ok: false, error: "Add an alert email address first." }, 400);
+      const result = await sendAlert(env, settings.alertTo, buildAlert({ kind: "test", row: {}, analysis: null, score: null }));
+      return result.sent
+        ? json({ ok: true, message: `Test sent to ${result.sent}. Check your inbox${result.failed ? `. ${result.failed} failed: ${result.error}` : ""}` })
+        : json({ ok: false, error: `Couldn't send: ${result.error}` }, 502);
+    }
     if (pathname === "/teardown/admin/api/delete-many") {
       if (!Array.isArray(body?.ids)) return json({ ok: false, error: "Bad request." }, 400);
       return json({ ok: true, deleted: await deleteLeads(env.DB, body.ids) });
     }
-    if (pathname === "/teardown/admin/api/test-run") return await testRun(env, body);
+    if (pathname === "/teardown/admin/api/test-run") return await testRun(env, body, me);
     if (pathname === "/teardown/admin/api/prompt") {
       if (typeof body?.prompt !== "string") return json({ ok: false, error: "Bad request." }, 400);
       const saved = await savePrompt(env.DB, body.prompt, me);
@@ -734,6 +887,7 @@ async function handleAction(request, env, pathname, me) {
       const changes = {};
       if (typeof body?.paused === "boolean") changes.paused = body.paused;
       if (body?.dailyLimit !== undefined) changes.dailyLimit = body.dailyLimit;
+      if (typeof body?.alertTo === "string") changes.alertTo = parseRecipients(body.alertTo).join(", ");
       return json({ ok: true, settings: await saveSettings(env.DB, changes) });
     }
   } catch (err) {
@@ -762,8 +916,10 @@ export async function handleAdmin(request, env, pathname) {
     q: (params.get("q") || "").trim().slice(0, 100),
     reachable: params.get("reachable") === "1",
     tests: params.get("tests") === "1",
+    due: params.get("due") === "1",
+    sort: params.get("sort") === "score" ? "score" : "",
   };
-  if (filters.tests) filters.stage = "";
+  if (filters.tests || filters.due) filters.stage = "";
 
   if (pathname === "/teardown/admin/leads.csv") {
     const rows = await listLeads(env.DB, { ...filters, limit: 5000 });
@@ -788,7 +944,8 @@ export async function handleAdmin(request, env, pathname) {
     const id = pathname.slice("/teardown/admin/lead/".length);
     const row = /^[0-9a-f-]{36}$/.test(id) ? await getLead(env.DB, id) : null;
     if (!row) return text("That teardown doesn't exist any more.", 404);
-    return new Response(renderLeadPage({ row, me, owners: ownerChoices(env) }), { headers: { "content-type": "text/html; charset=utf-8", ...PRIVATE_HEADERS } });
+    const events = await listEvents(env.DB, id);
+    return new Response(renderLeadPage({ row, me, owners: ownerChoices(env), events }), { headers: { "content-type": "text/html; charset=utf-8", ...PRIVATE_HEADERS } });
   }
   if (pathname === "/teardown/admin/prompt") {
     const [active, versions] = await Promise.all([getActivePrompt(env.DB), listPromptVersions(env.DB)]);

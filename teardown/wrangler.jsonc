@@ -20,6 +20,9 @@
   // Headless browser for the screenshot shown with each teardown. Free plan: 10 minutes of browser time a day.
   "browser": { "binding": "BROWSER" },
 
+  // Sends lead alerts. On the free plan it can only email addresses verified in Email Routing.
+  "send_email": [{ "name": "EMAIL" }],
+
   // Leads, settings and auditor prompt versions. Created in the Cloudflare account on 2026-11-10.
   "d1_databases": [
     { "binding": "DB", "database_name": "ihmb-teardown", "database_id": "90499b23-3f25-4ad9-b5d9-8e38511ccc5e" }

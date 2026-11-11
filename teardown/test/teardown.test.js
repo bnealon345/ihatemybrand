@@ -67,6 +67,9 @@ function fakeNet({ dns, pages }) {
   const calls = [];
   const impl = async (url, init = {}) => {
     url = String(url);
+    if (url.startsWith("https://api.anthropic.com/") && init.body && String(init.body).includes('"lead_analysis"')) {
+      return pages.__analysis ? pages.__analysis(init) : new Response("no analysis in this test", { status: 500 });
+    }
     calls.push(url);
     if (url.startsWith("https://cloudflare-dns.com/")) return dnsResponse(url, dns);
     const page = pages[url];
@@ -499,7 +502,7 @@ test("admin is locked, and shows leads safely once unlocked", async () => {
   assert.match(line, /bobsauto\.com,ok,,service@bobsauto\.com; bob@bobsauto\.com,'\+17325550142,https:\/\/bobsauto\.com\/contact-us/);
   assert.match(line, /"'=HYPERLINK\(""http:\/\/evil""\)"/, "formulas are defused");
 
-  assert.equal(toCsv([]).trim().split(",").length, 21);
+  assert.equal(toCsv([]).trim().split(",").length, 23);
 });
 
 // ---------- back office ----------
@@ -604,8 +607,8 @@ test("filters, searches, counts and exports", async () => {
   const csv = await text("/teardown/admin/leads.csv?stage=won");
   const lines = csv.trim().split("\r\n");
   assert.equal(lines.length, 2);
-  assert.match(lines[0], /country,stage,owner,admin_notes,prompt_version,id$/);
-  assert.match(lines[1], /,won,,,0,[0-9a-f-]{36}$/);
+  assert.match(lines[0], /country,stage,owner,admin_notes,prompt_version,lead_score,follow_up,id$/);
+  assert.match(lines[1], /,won,,,0,\d+,,[0-9a-f-]{36}$/);
 });
 
 test("deletes a lead for good", async () => {
@@ -631,7 +634,7 @@ test("pause switch and daily limit control the public teardown", async () => {
   assert.deepEqual([(await run(0)).status, (await run(1)).status, (await run(2)).status], [200, 200, 429]);
 
   const paused = await (await admin(env, "/teardown/admin/api/settings", { body: { paused: true } })).json();
-  assert.deepEqual(paused.settings, { paused: true, dailyLimit: 2 });
+  assert.deepEqual(paused.settings, { paused: true, dailyLimit: 2, alertTo: "" });
   const calls = net.calls.length;
   const blocked = await run(3);
   assert.equal(blocked.status, 503);
@@ -1009,4 +1012,186 @@ test("deletes several teardowns at once", async () => {
   assert.equal(env.DB.rows().length, 0);
   res = await admin(env, "/teardown/admin/api/delete-many", { body: { ids: "all" } });
   assert.equal(res.status, 400);
+});
+
+// ---------- lead analysis, score, trail, alerts ----------
+
+const ANALYSIS = {
+  business_type: "Payroll software company",
+  business_summary: "Sells payroll software to restaurants.",
+  business_score: 7,
+  business_reasons: ["Clear product", "Has a contact page"],
+  brand_score: 4,
+  brand_reasons: ["Vague headline"],
+  package: "website",
+  package_why: "The homepage is the problem.",
+  outreach_subject: "Your headline says nothing",
+  outreach_body: "Hi,\n\nYour headline reads \"Empowering Tomorrow\".\n\nReply \"no thanks\" and we won't email again.\n\n[Your name]\nI Hate My Brand",
+};
+const analysisReply = (input = ANALYSIS) => () => Response.json({ content: [{ type: "tool_use", name: "lead_analysis", input }] });
+
+function fakeMailer({ fail = false } = {}) {
+  const sent = [];
+  return { sent, send: async (msg) => { if (fail) throw new Error("destination address not verified"); sent.push(msg); return { messageId: "m" + sent.length }; } };
+}
+
+function bobNetWithAnalysis(analysis = analysisReply()) {
+  return fakeNet({
+    dns: { "bobsauto.com": { A: ["93.184.216.34"] } },
+    pages: {
+      "https://bobsauto.com/": () => html(CONTACT_HOME),
+      "https://bobsauto.com/contact-us": () => html(CONTACT_PAGE),
+      "https://api.anthropic.com/v1/messages": claudeReply(GOOD_NOTE),
+      __analysis: analysis,
+    },
+  });
+}
+
+async function leadEnv() {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1(), TEARDOWN_KV: kvWithMeta(), ADMIN_USERS: USERS, EMAIL: fakeMailer() };
+  await admin(env, "/teardown/admin/api/settings", { body: { alertTo: "Brian@Example.com, ned@example.com, not-an-email" } });
+  return env;
+}
+const trail = async (env, id) => (await (await import("../src/leads.js")).listEvents(env.DB, id)).map((e) => e.detail).reverse();
+
+test("a new lead is analysed, scored, logged and announced by email", async () => {
+  const env = await leadEnv();
+  const data = await withNet(bobNetWithAnalysis(), async () => (await worker.fetch(post({ url: "bobsauto.com" }), env, {})).json());
+  assert.doesNotMatch(JSON.stringify(data), /Payroll software company|business_score|outreach/i, "the private read never goes to the visitor");
+
+  const row = env.DB.rows()[0];
+  const read = JSON.parse(row.analysis_json);
+  assert.equal(read.businessScore, 7);
+  assert.equal(read.brandScore, 4);
+  assert.equal(read.package, "Website");
+  assert.equal(read.packagePrice, "$999");
+  // 7*4 business + (10-4)*2 room to fix + 12 site email + 6 phone
+  assert.equal(row.lead_score, 28 + 12 + 12 + 6);
+
+  assert.deepEqual(env.EMAIL.sent.map((m) => m.to), ["brian@example.com", "ned@example.com"]);
+  const mail = env.EMAIL.sent[0];
+  assert.equal(mail.from, "alerts@ihatemybrand.com");
+  assert.equal(mail.subject, "New teardown: bobsauto.com. Lead score 58 (Warm)");
+  assert.match(mail.text, /On their site: service@bobsauto\.com/);
+  assert.match(mail.text, /Suggested: Website \(\$999\)/);
+  assert.match(mail.text, new RegExp("https://ihatemybrand\\.com/teardown/admin/lead/" + row.id));
+  assert.match(mail.text, /Draft email[\s\S]*Your headline says nothing/);
+
+  assert.deepEqual(await trail(env, row.id), [
+    "Ran a teardown on bobsauto.com",
+    "Lead score 58 (Warm). Business 7/10, brand 4/10. Suggested: Website. Outreach drafted.",
+    "Alert emailed to 2 people",
+  ]);
+});
+
+test("leaving an email raises the score, goes on the trail and sends a second alert", async () => {
+  const env = await leadEnv();
+  const data = await withNet(bobNetWithAnalysis(), async () => (await worker.fetch(post({ url: "bobsauto.com" }), env, {})).json());
+  await worker.fetch(emailPost({ leadId: data.leadId, email: "bob@bobsauto.com" }), env, {});
+
+  const row = env.DB.rows()[0];
+  assert.equal(row.lead_score, 28 + 12 + 30 + 4 + 8);
+  assert.equal(env.EMAIL.sent.length, 4);
+  assert.equal(env.EMAIL.sent[2].subject, "bobsauto.com left their email. Lead score 82 (Hot)");
+  assert.match(env.EMAIL.sent[2].text, /just left their email: bob@bobsauto\.com/);
+  assert.deepEqual((await trail(env, row.id)).slice(3), [
+    "Left their email: bob@bobsauto.com",
+    "Lead score 82 (Hot) now that they left an email",
+    "Alert emailed to 2 people",
+  ]);
+});
+
+test("a repeat site reuses the saved read without paying for another analysis", async () => {
+  const env = await leadEnv();
+  let analysisCalls = 0;
+  const net = bobNetWithAnalysis(() => { analysisCalls++; return analysisReply()(); });
+  await withNet(net, () => worker.fetch(post({ url: "bobsauto.com" }), env, {}));
+  await withNet(net, () => worker.fetch(post({ url: "bobsauto.com" }), env, {}));
+  assert.equal(analysisCalls, 1);
+  const rows = env.DB.rows();
+  assert.equal(rows[1].from_cache, 1);
+  assert.equal(JSON.parse(rows[1].analysis_json).package, "Website");
+  assert.equal(env.EMAIL.sent.length, 4, "each visit is announced");
+});
+
+test("alerts and analysis failing never break a teardown, and the trail says why", async () => {
+  const env = await leadEnv();
+  env.EMAIL = fakeMailer({ fail: true });
+  const res = await withNet(bobNetWithAnalysis(() => new Response("down", { status: 529 })), () => worker.fetch(post({ url: "bobsauto.com" }), env, {}));
+  assert.equal(res.status, 200);
+  const row = env.DB.rows()[0];
+  assert.equal(row.analysis_json, null);
+  assert.equal(row.lead_score, 18);
+  assert.deepEqual((await trail(env, row.id)).slice(1), [
+    "Lead score 18 (Cool). No AI read on this one.",
+    "Alert not sent: destination address not verified",
+  ]);
+
+  const test = await admin(env, "/teardown/admin/api/test-alert", { body: {} });
+  assert.equal(test.status, 502);
+  assert.match((await test.json()).error, /not verified/);
+  env.EMAIL = fakeMailer();
+  assert.match((await (await admin(env, "/teardown/admin/api/test-alert", { body: {} })).json()).message, /Test sent to 2/);
+  assert.equal(env.EMAIL.sent[0].subject, "Test alert from the teardown back office");
+});
+
+test("the lead page shows the score, the read, an editable draft and the trail", async () => {
+  const env = await leadEnv();
+  const data = await withNet(bobNetWithAnalysis(), async () => (await worker.fetch(post({ url: "bobsauto.com" }), env, {})).json());
+  const id = data.leadId;
+
+  await admin(env, "/teardown/admin/api/lead", { user: "brian", pw: "brianpass-2", body: { id, stage: "contacted", owner: "ned", followUp: "2026-11-01" } });
+  await admin(env, "/teardown/admin/api/event", { body: { id, type: "note", detail: "Called, left a voicemail <b>" } });
+  await admin(env, "/teardown/admin/api/event", { body: { id, type: "reply", detail: "wants a quote" } });
+  assert.equal((await admin(env, "/teardown/admin/api/lead", { body: { id, followUp: "next week" } })).status, 400);
+  assert.equal((await admin(env, "/teardown/admin/api/event", { body: { id, type: "hack" } })).status, 400);
+  assert.equal((await admin(env, "/teardown/admin/api/event", { body: { id, type: "note", detail: "x" }, origin: "https://evil.example" })).status, 403);
+
+  const page = await (await admin(env, "/teardown/admin/lead/" + id, { user: "brian", pw: "brianpass-2" })).text();
+  new Function(page.match(/<script>([\s\S]*?)<\/script>/)[1]);
+  assert.match(page, /<div class="bignum">58/);
+  assert.match(page, /Business looks real: 7\/10<\/span><b>\+28<\/b>/);
+  assert.match(page, /<b>Payroll software company\.<\/b> Sells payroll software to restaurants\./);
+  assert.match(page, /Pitch: Website \(\$999\)/);
+  assert.match(page, /id="draftto" value="service@bobsauto\.com"/);
+  assert.match(page, /id="draftsubject" value="Your headline says nothing"/);
+  assert.match(page, /Brian\nI Hate My Brand<\/textarea>/, "the draft is signed with whoever is signed in");
+  assert.doesNotMatch(page, /\[Your name\]/);
+  assert.match(page, /type="date" data-field="followUp" value="2026-11-01"/);
+  for (const line of ["Stage: new to contacted", "Assigned to ned", "Follow-up set for 2026-11-01", "Called, left a voicemail &lt;b&gt;", "They replied: wants a quote", "Stage: contacted to replied"]) {
+    assert.ok(page.includes(line), line);
+  }
+
+  const list = await (await admin(env, "/teardown/admin")).text();
+  assert.match(list, /<span class="score warm" title="Lead score">58 Warm<\/span>/);
+  assert.match(list, /Follow-ups due <span>1<\/span>/);
+  assert.match(list, /<b>1<\/b>Replied <i>100%<\/i>/);
+  const due = await (await admin(env, "/teardown/admin?due=1")).text();
+  assert.match(due, /data-domain="bobsauto\.com"/);
+  await admin(env, "/teardown/admin/api/lead", { body: { id, stage: "won" } });
+  assert.doesNotMatch(await (await admin(env, "/teardown/admin?due=1")).text(), /data-domain="bobsauto\.com"/, "won leads drop off the due list");
+
+  await admin(env, "/teardown/admin/api/delete", { body: { id } });
+  assert.deepEqual(await trail(env, id), [], "deleting a lead deletes its trail");
+});
+
+test("email copied to the logging address updates the right lead's trail and stage", async () => {
+  const env = await leadEnv();
+  const data = await withNet(bobNetWithAnalysis(), async () => (await worker.fetch(post({ url: "bobsauto.com" }), env, {})).json());
+  const msg = (from, to, subject) => ({ from, to: "log@ihatemybrand.com", headers: new Headers({ subject, to, cc: "" }) });
+
+  await worker.email(msg("brian@gmail.example", "Bob <Service@BobsAuto.com>", "Your headline says nothing"), env);
+  let row = env.DB.rows()[0];
+  assert.equal(row.stage, "contacted");
+  await worker.email(msg("service@bobsauto.com", "brian@gmail.example", "Re: Your headline says nothing"), env);
+  row = env.DB.rows()[0];
+  assert.equal(row.stage, "replied");
+  await worker.email(msg("stranger@elsewhere.example", "nobody@nowhere.example", "spam"), env);
+
+  assert.deepEqual((await trail(env, data.leadId)).slice(3), [
+    'brian emailed service@bobsauto.com: "Your headline says nothing"',
+    "Stage: new to contacted",
+    'They emailed: "Re: Your headline says nothing"',
+    "Stage: contacted to replied",
+  ]);
 });

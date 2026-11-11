@@ -25,6 +25,9 @@ const SCHEMA = [
     note_json TEXT,
     shot_id TEXT,
     is_test INTEGER NOT NULL DEFAULT 0,
+    analysis_json TEXT,
+    lead_score INTEGER,
+    follow_up TEXT,
     stage TEXT NOT NULL DEFAULT 'new',
     owner TEXT,
     admin_notes TEXT,
@@ -33,6 +36,9 @@ const SCHEMA = [
   )`,
   `CREATE INDEX IF NOT EXISTS teardowns_created_at ON teardowns (created_at)`,
   `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  // The trail on each lead: what happened, when, and who or what did it.
+  `CREATE TABLE IF NOT EXISTS lead_events (id INTEGER PRIMARY KEY AUTOINCREMENT, lead_id TEXT NOT NULL, at TEXT NOT NULL, by TEXT, type TEXT NOT NULL, detail TEXT)`,
+  `CREATE INDEX IF NOT EXISTS lead_events_lead ON lead_events (lead_id, id)`,
   // Every saved auditor prompt. The newest row is the one in use. An empty prompt means "the built-in one".
   `CREATE TABLE IF NOT EXISTS prompt_versions (version INTEGER PRIMARY KEY, created_at TEXT NOT NULL, created_by TEXT, prompt TEXT NOT NULL)`,
 ];
@@ -48,10 +54,50 @@ const LATER_COLUMNS = {
   note_json: "TEXT",
   shot_id: "TEXT",
   is_test: "INTEGER NOT NULL DEFAULT 0",
+  analysis_json: "TEXT",
+  lead_score: "INTEGER",
+  follow_up: "TEXT",
 };
 
 export const STAGES = ["new", "contacted", "replied", "won", "not_a_fit", "do_not_contact"];
-export const DEFAULT_SETTINGS = { paused: false, dailyLimit: 5 };
+export const DEFAULT_SETTINGS = { paused: false, dailyLimit: 5, alertTo: "" };
+const CLOSED_STAGES = ["won", "not_a_fit", "do_not_contact"];
+const todayDate = (now = new Date()) => now.toISOString().slice(0, 10);
+
+// ---------- the trail ----------
+
+/** Adds a line to a lead's trail. Never throws: the trail must not break the thing it records. */
+export async function logEvent(db, leadId, type, detail = "", by = "system", now = new Date()) {
+  try {
+    await ensureSchema(db);
+    await db.prepare(`INSERT INTO lead_events (lead_id, at, by, type, detail) VALUES (?, ?, ?, ?, ?)`)
+      .bind(leadId, now.toISOString(), String(by || "system").slice(0, 80), type, String(detail || "").slice(0, 500)).run();
+  } catch (err) {
+    console.error("Could not log event", err?.message || err);
+  }
+}
+
+export async function listEvents(db, leadId, limit = 200) {
+  await ensureSchema(db);
+  return (await db.prepare(`SELECT * FROM lead_events WHERE lead_id = ? ORDER BY id DESC LIMIT ?`).bind(leadId, limit).all()).results || [];
+}
+
+export async function saveAnalysis(db, id, analysis, score) {
+  await ensureSchema(db);
+  await db.prepare(`UPDATE teardowns SET analysis_json = COALESCE(?, analysis_json), lead_score = ? WHERE id = ?`)
+    .bind(analysis ? JSON.stringify(analysis) : null, score ?? null, id).run();
+}
+
+/** The most recent real leads that this email address belongs to. */
+export async function findLeadsByEmail(db, email, limit = 3) {
+  await ensureSchema(db);
+  const needle = String(email || "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+$/.test(needle)) return [];
+  return (await db.prepare(
+    `SELECT * FROM teardowns WHERE is_test = 0 AND (lower(coalesce(visitor_email, '')) = ? OR instr(lower(coalesce(site_emails, '')), ?))
+     ORDER BY created_at DESC LIMIT ?`,
+  ).bind(needle, '"' + needle + '"', limit).all()).results || [];
+}
 
 const ready = new WeakMap();
 
@@ -127,7 +173,7 @@ export async function saveVisitorEmail(db, id, email) {
 const REACHABLE = `(visitor_email IS NOT NULL OR site_emails NOT IN ('[]', '') OR site_phones NOT IN ('[]', ''))`;
 
 /** Newest first. Filters: stage, q (search text), reachable (only leads with a way to contact them). */
-export async function listLeads(db, { stage, q, reachable, tests = false, limit = 500 } = {}) {
+export async function listLeads(db, { stage, q, reachable, tests = false, due = false, sort = "", limit = 500 } = {}) {
   await ensureSchema(db);
   // Test runs from the back office are kept apart from real leads.
   const where = [tests ? `is_test = 1` : `is_test = 0`];
@@ -137,6 +183,10 @@ export async function listLeads(db, { stage, q, reachable, tests = false, limit 
     args.push(stage);
   }
   if (reachable) where.push(REACHABLE);
+  if (due) {
+    where.push(`follow_up IS NOT NULL AND follow_up <= ? AND stage NOT IN ('won', 'not_a_fit', 'do_not_contact')`);
+    args.push(todayDate());
+  }
   const needle = String(q || "").trim().toLowerCase().slice(0, 100);
   if (needle) {
     // instr, not LIKE, so % and _ in a search are just characters.
@@ -146,7 +196,7 @@ export async function listLeads(db, { stage, q, reachable, tests = false, limit 
     );
     args.push(needle, needle, needle, needle, needle, needle);
   }
-  const sql = `SELECT * FROM teardowns ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY created_at DESC LIMIT ?`;
+  const sql = `SELECT * FROM teardowns ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY ${due ? "follow_up ASC," : sort === "score" ? "lead_score DESC," : ""} created_at DESC LIMIT ?`;
   const res = await db.prepare(sql).bind(...args, limit).all();
   return res.results || [];
 }
@@ -174,8 +224,19 @@ export async function leadStats(db, now = new Date()) {
   }
   const num = (v) => Number(v || 0);
   const tests = num((await db.prepare(`SELECT COUNT(*) AS n FROM teardowns WHERE is_test = 1`).all()).results?.[0]?.n);
+  const due = num((await db.prepare(
+    `SELECT COUNT(*) AS n FROM teardowns WHERE is_test = 0 AND follow_up IS NOT NULL AND follow_up <= ? AND stage NOT IN ('won', 'not_a_fit', 'do_not_contact')`,
+  ).bind(today).all()).results?.[0]?.n);
   return {
     tests,
+    due,
+    funnel: {
+      teardowns: num(totals.total),
+      reachable: num(totals.reachable),
+      contacted: stages.contacted + stages.replied + stages.won,
+      replied: stages.replied + stages.won,
+      won: stages.won,
+    },
     total: num(totals.total), today: num(totals.today), week: num(totals.week),
     gaveEmail: num(totals.gave_email), reachable: num(totals.reachable), stages,
   };
@@ -184,26 +245,42 @@ export async function leadStats(db, now = new Date()) {
 /** Change stage, owner or notes. Returns true if the lead exists. Throws on a bad value. */
 export async function updateLead(db, id, changes, by, now = new Date()) {
   await ensureSchema(db);
+  const before = await getLead(db, id);
+  if (!before) return false;
   const sets = [];
   const args = [];
+  const trail = [];
+  const nice = (value) => String(value || "").replace(/_/g, " ");
   if (changes.stage !== undefined) {
     if (!STAGES.includes(changes.stage)) throw new RangeError("Unknown stage.");
     sets.push(`stage = ?`);
     args.push(changes.stage);
+    if (changes.stage !== before.stage) trail.push(["stage", `Stage: ${nice(before.stage)} to ${nice(changes.stage)}`]);
   }
   if (changes.owner !== undefined) {
     const owner = String(changes.owner || "").trim().toLowerCase().slice(0, 40);
     sets.push(`owner = ?`);
     args.push(owner || null);
+    if ((owner || null) !== (before.owner || null)) trail.push(["owner", owner ? `Assigned to ${owner}` : "Unassigned"]);
+  }
+  if (changes.followUp !== undefined) {
+    const date = String(changes.followUp || "").trim();
+    if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new RangeError("That date doesn't look right.");
+    sets.push(`follow_up = ?`);
+    args.push(date || null);
+    if ((date || null) !== (before.follow_up || null)) trail.push(["follow_up", date ? `Follow-up set for ${date}` : "Follow-up cleared"]);
   }
   if (changes.notes !== undefined) {
+    const notes = String(changes.notes || "").slice(0, 4000) || null;
     sets.push(`admin_notes = ?`);
-    args.push(String(changes.notes || "").slice(0, 4000) || null);
+    args.push(notes);
+    if (notes !== (before.admin_notes || null)) trail.push(["notes", notes ? "Notes updated" : "Notes cleared"]);
   }
   if (!sets.length) throw new RangeError("Nothing to change.");
   sets.push(`updated_at = ?`, `updated_by = ?`);
   args.push(now.toISOString(), by);
   const res = await db.prepare(`UPDATE teardowns SET ${sets.join(", ")} WHERE id = ?`).bind(...args, id).run();
+  for (const [type, detail] of trail) await logEvent(db, id, type, detail, by, now);
   return (res?.meta?.changes ?? 0) > 0;
 }
 
@@ -217,12 +294,14 @@ export async function deleteLeads(db, ids) {
   await ensureSchema(db);
   const list = [...new Set(ids)].filter((id) => /^[0-9a-f-]{36}$/.test(String(id))).slice(0, 200);
   if (!list.length) return 0;
+  await db.prepare(`DELETE FROM lead_events WHERE lead_id IN (${list.map(() => "?").join(", ")})`).bind(...list).run();
   const res = await db.prepare(`DELETE FROM teardowns WHERE id IN (${list.map(() => "?").join(", ")})`).bind(...list).run();
   return res?.meta?.changes ?? 0;
 }
 
 export async function deleteLead(db, id) {
   await ensureSchema(db);
+  await db.prepare(`DELETE FROM lead_events WHERE lead_id = ?`).bind(id).run();
   const res = await db.prepare(`DELETE FROM teardowns WHERE id = ?`).bind(id).run();
   return (res?.meta?.changes ?? 0) > 0;
 }
@@ -239,6 +318,7 @@ export async function getSettings(db, now = new Date()) {
   for (const row of (await db.prepare(`SELECT key, value FROM settings`).all()).results || []) {
     if (row.key === "paused") out.paused = row.value === "1";
     if (row.key === "dailyLimit") out.dailyLimit = validLimit(row.value) ?? out.dailyLimit;
+    if (row.key === "alertTo") out.alertTo = String(row.value || "");
     if (row.key === "scheduledLimit") nextLimit = validLimit(row.value);
     if (row.key === "scheduledLimitFrom") nextFrom = row.value;
   }
@@ -255,6 +335,7 @@ export async function saveSettings(db, changes) {
   const put = (key, value) =>
     db.prepare(`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).bind(key, value).run();
   if (changes.paused !== undefined) await put("paused", changes.paused ? "1" : "0");
+  if (changes.alertTo !== undefined) await put("alertTo", String(changes.alertTo || "").slice(0, 400));
   if (changes.dailyLimit !== undefined) {
     const n = Number(changes.dailyLimit);
     if (!Number.isInteger(n) || n < 1 || n > 100) throw new RangeError("The daily limit must be a whole number from 1 to 100.");
@@ -310,7 +391,7 @@ export function parseList(value) {
 const CSV_COLUMNS = [
   "created_at", "domain", "status", "visitor_email", "site_emails", "site_phones", "contact_page",
   "social_links", "note_problem", "note_why", "note_fix", "site_title", "input_url", "final_url",
-  "from_cache", "country", "stage", "owner", "admin_notes", "prompt_version", "id",
+  "from_cache", "country", "stage", "owner", "admin_notes", "prompt_version", "lead_score", "follow_up", "id",
 ];
 const LIST_COLUMNS = new Set(["site_emails", "site_phones", "social_links"]);
 

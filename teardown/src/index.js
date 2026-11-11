@@ -11,7 +11,9 @@
 import { TeardownError, normalizeUrl, safeFetchPage } from "./safe-fetch.js";
 import { extractPage, extractContacts, mergeContacts, hasTooLittleContent } from "./extract.js";
 import { runFreeAudit } from "./audit.js";
-import { insertLead, updateContacts, saveVisitorEmail, getSettings, getActivePrompt, DEFAULT_SETTINGS } from "./leads.js";
+import { insertLead, updateContacts, saveVisitorEmail, getSettings, getActivePrompt, logEvent, DEFAULT_SETTINGS } from "./leads.js";
+import { scoreAndAlert } from "./followup.js";
+import { handleInboundEmail } from "./mail.js";
 import { handleAdmin } from "./admin.js";
 import { serveHome } from "./home.js";
 import { takeScreenshot, saveScreenshot, serveScreenshot } from "./shot.js";
@@ -73,6 +75,10 @@ async function recordLead(env, lead) {
   if (!env.DB) return;
   try {
     await insertLead(env.DB, lead);
+    await logEvent(env.DB, lead.id, "created",
+      lead.status === "ok" ? `Ran a teardown on ${lead.domain}${lead.fromCache ? " (repeat site, shown the saved note)" : ""}`
+      : `Tried a teardown on ${lead.domain}. Their site failed: ${String(lead.status).replace(/_/g, " ")}`,
+      "visitor");
   } catch (err) {
     console.error("Could not save lead", err?.stack || err);
   }
@@ -126,6 +132,9 @@ async function handleAudit(request, env, ctx) {
         note: hit.result.note, contacts: hit.contacts, socialLinks: hit.socialLinks, siteTitle: hit.siteTitle,
         shotId: hit.result.shot ? String(hit.result.shot).split("/").pop() : null,
       });
+      const followUp = scoreAndAlert(env, lead.id, { analysis: hit.analysis || null });
+      if (ctx?.waitUntil) ctx.waitUntil(followUp);
+      else await followUp;
       return json({ ok: true, cached: true, leadId: lead.id, ...hit.result });
     }
   }
@@ -179,10 +188,12 @@ async function handleAudit(request, env, ctx) {
   const afterwards = (async () => {
     const full = await enrichContacts(contacts, fetched.finalUrl);
     if (full !== contacts && env.DB) await updateContacts(env.DB, lead.id, full);
+    // The private read on the lead, its score, and the alert to Ned and Brian.
+    const analysis = await scoreAndAlert(env, lead.id, { page, note });
     if (kv) {
       await kv.put(
         cacheKey,
-        JSON.stringify({ result, contacts: full, socialLinks: page.socialLinks, siteTitle: page.title }),
+        JSON.stringify({ result, contacts: full, socialLinks: page.socialLinks, siteTitle: page.title, analysis }),
         { expirationTtl: CACHE_TTL_SECONDS },
       );
     }
@@ -193,7 +204,7 @@ async function handleAudit(request, env, ctx) {
   return json({ ok: true, cached: false, leadId: lead.id, ...result });
 }
 
-async function handleEmail(request, env) {
+async function handleEmail(request, env, ctx) {
   const body = await readJson(request);
   const leadId = String(body?.leadId ?? "");
   const email = String(body?.email ?? "").trim().toLowerCase();
@@ -205,10 +216,19 @@ async function handleEmail(request, env) {
   await checkRateLimit(env, "email", request.headers.get("cf-connecting-ip"), EMAIL_SAVES_PER_IP_PER_DAY, "That's a lot of emails for one day. Try again tomorrow.");
   const saved = await saveVisitorEmail(env.DB, leadId, email);
   if (!saved) throw new TeardownError("bad_request", "We couldn't find that teardown. Run it again.", 404);
+  await logEvent(env.DB, leadId, "email_left", `Left their email: ${email}`, "visitor");
+  const followUp = scoreAndAlert(env, leadId, { kind: "email_left" });
+  if (ctx?.waitUntil) ctx.waitUntil(followUp);
+  else await followUp;
   return json({ ok: true });
 }
 
 export default {
+  // Email sent to the logging address. See mail.js.
+  async email(message, env) {
+    await handleInboundEmail(message, env);
+  },
+
   async fetch(request, env, ctx) {
     const { pathname } = new URL(request.url);
 

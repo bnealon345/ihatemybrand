@@ -41,6 +41,13 @@ What it does:
 - **Open any teardown in full:** click its headline to see the screenshot, the quotes from their site, the whole note laid out as the visitor saw it, and the contacts, with the pipeline controls beside it.
 - **Run a test teardown:** a box at the top of the Leads tab. Skips the daily limit, stays out of your numbers and the CSV, and is filed under the Tests tab.
 - **Delete:** removes a lead for good, for when someone asks you to. Tick several rows to delete them together.
+- **Lead score and AI read:** every lead gets a private analysis after the visitor has their note: what the business is, how real it looks out of 10, how strong the brand is out of 10, which package to pitch, and a drafted outreach email. The lead score (0 to 100) adds those to how reachable they are, and the lead page shows the sum.
+- **Outreach draft:** on each lead, editable, signed with whoever is signed in. "Open in my email" opens it in your own mail app. Nothing is sent by the system.
+- **Activity trail:** every lead keeps a dated history: teardown run, score, alert sent, email left, stage and owner changes, notes, replies. Add your own lines, or click "They replied".
+- **Follow-ups:** set a date on a lead. The "Follow-ups due" tab shows what's due today or overdue.
+- **Lead alerts:** set the addresses under "Lead alerts" on the Leads tab. An email goes out when a teardown is run and again if the visitor leaves their email. On the free Cloudflare plan the addresses must be verified destination addresses in Email Routing. "Send a test alert" checks it.
+- **Funnel:** teardowns, reachable, contacted, replied, won, with percentages.
+- **Email logging (needs one Cloudflare rule):** route an address such as `log@ihatemybrand.com` to this Worker in Email Routing. BCC it on outreach and the lead's trail records the email and moves New to Contacted. Mail from a lead's address records a reply. Only sender, recipients and subject are read.
 - **Teardown controls:** pause new teardowns (stops all audit spending) and set how many free teardowns one visitor gets per day.
 - **Auditor prompt** (its own tab): edit what the AI is told before it reads a site. Every save is a numbered version you can go back to, and "Try it before you save" runs a draft on a real site without saving or creating a lead. A saved change applies to the next teardown. The answer format and the never-invent rule are locked and added after your text.
 
@@ -67,6 +74,10 @@ For an automated outreach system, read the same table (`teardowns` in the D1 dat
 | `src/safe-fetch.js` | Fetches the visitor's site. Blocks private addresses, caps time and size. |
 | `src/extract.js` | Pulls page content for the auditor, and contact details for the lead. |
 | `src/audit.js` | The auditor prompt and the Claude API call. |
+| `src/analysis.js` | The private AI read on each lead, the package list, and the lead score. |
+| `src/followup.js` | Runs the read, scores the lead, writes the trail, sends the alert. |
+| `src/notify.js` | Lead alert emails. |
+| `src/mail.js` | Logs email copied to the logging address onto the lead's trail. |
 | `src/shot.js` | The screenshot shown with each teardown. |
 | `src/home.js` | Adds the teardown band, nav link and thumbs logo to the main site's homepage. |
 | `src/leads.js` | The leads table and CSV. |
