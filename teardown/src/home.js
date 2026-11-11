@@ -19,6 +19,11 @@ nav a.tdn i{font-family:var(--mono);font-style:normal;font-weight:500;font-size:
 .ihmb-thumb svg{width:78%;height:78%;display:block}
 .ihmb-thumb .thumb{transform-box:view-box;transform-origin:51px 46px;transition:transform .35s cubic-bezier(.3,1.4,.5,1)}
 .hero h1:has(.swap.hov:hover) .ihmb-thumb .thumb{transform:rotate(180deg)}
+/* Hovering the thumb does the same thing: the thumb flips up and "hate" turns to "love". */
+.hero h1 .ihmb-thumb{cursor:default}
+.hero h1 .ihmb-thumb:hover .thumb{transform:rotate(180deg)}
+.hero h1:has(.ihmb-thumb:hover) .swap.hov .a{opacity:0;transform:translateY(.25em)}
+.hero h1:has(.ihmb-thumb:hover) .swap.hov .b{opacity:1;transform:none}
 
 .tdb{position:relative;background:var(--lime);color:var(--navy);margin-bottom:clamp(56px,7vw,96px)}
 .tdb .wrap{position:relative;padding-top:clamp(56px,7vw,92px);padding-bottom:clamp(60px,7vw,96px)}
