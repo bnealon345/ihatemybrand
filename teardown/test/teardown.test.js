@@ -1,0 +1,744 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { normalizeUrl, isPublicIp, safeFetchPage, TeardownError } from "../src/safe-fetch.js";
+import { extractPage, hasTooLittleContent, decodeEntities } from "../src/extract.js";
+import worker, { domainOf } from "../src/index.js";
+
+const SAMPLE = `<!doctype html><html><head>
+<title>Acme &amp; Co | Solutions</title>
+<meta name="description" content="We deliver synergy.">
+<meta property="og:image" content="/og.png">
+<meta name="viewport" content="width=device-width">
+<script>var secret = "do not leak";</script><style>.x{color:red}</style>
+</head><body>
+<nav><a href="/">Home</a><a href="/about">About</a></nav>
+<h1>Empowering <span>Tomorrow</span></h1>
+<h2>What we do</h2>
+<p>${"We leverage best in class solutions for forward thinking teams. ".repeat(8)}</p>
+<a class="btn btn-primary" href="/contact">Learn More</a>
+<button type="submit">Submit</button>
+<a href="https://www.instagram.com/acme">IG</a>
+<a href="https://notinstagram.com.evil.io/x">fake</a>
+<img src="/a.png" alt="Team photo"><img src="/b.png">
+<!-- <h1>commented out</h1> -->
+</body></html>`;
+
+// ---------- URL rules ----------
+
+test("accepts ordinary sites and adds https", () => {
+  assert.equal(normalizeUrl("example.com").toString(), "https://example.com/");
+  assert.equal(normalizeUrl("  http://www.Example.com/path#frag ").toString(), "http://www.example.com/path");
+});
+
+test("blocks private, internal and odd targets", () => {
+  const bad = [
+    "localhost", "localhost:8080", "http://127.0.0.1", "http://2130706433", "http://0x7f.1",
+    "http://10.0.0.5", "http://192.168.1.1/admin", "http://169.254.169.254/latest/meta-data",
+    "http://[::1]", "http://[fd00::1]", "https://8.8.8.8", "intranet", "printer.local",
+    "db.internal", "foo.localhost", "https://example.com:8443", "https://user:pw@example.com",
+    "ftp://example.com", "file:///etc/passwd", "javascript:alert(1)", "", "two words.com",
+  ];
+  for (const input of bad) {
+    assert.throws(() => normalizeUrl(input), TeardownError, `should block: ${input}`);
+  }
+});
+
+test("classifies IP addresses", () => {
+  for (const ip of ["93.184.216.34", "1.1.1.1", "2606:4700::1111"]) assert.equal(isPublicIp(ip), true, ip);
+  for (const ip of [
+    "127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.1", "169.254.169.254",
+    "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "::1", "::", "fc00::1", "fd12::1",
+    "fe80::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:7f00:1", "2001:db8::1", "64:ff9b::a00:1", "junk",
+  ]) assert.equal(isPublicIp(ip), false, ip);
+});
+
+// ---------- fetching ----------
+
+function dnsResponse(url, table) {
+  const u = new URL(url);
+  const name = u.searchParams.get("name");
+  const type = u.searchParams.get("type");
+  const ips = (table[name] || {})[type] || [];
+  return Response.json({ Status: 0, Answer: ips.map((data) => ({ type: type === "A" ? 1 : 28, data })) });
+}
+
+function fakeNet({ dns, pages }) {
+  const calls = [];
+  const impl = async (url, init = {}) => {
+    url = String(url);
+    calls.push(url);
+    if (url.startsWith("https://cloudflare-dns.com/")) return dnsResponse(url, dns);
+    const page = pages[url];
+    if (!page) throw new TypeError("fetch failed");
+    return typeof page === "function" ? page(init) : page;
+  };
+  impl.calls = calls;
+  return impl;
+}
+
+const html = (body, status = 200) => new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+const redirect = (to) => new Response(null, { status: 302, headers: { location: to } });
+
+test("fetches a public page and follows a safe redirect", async () => {
+  const net = fakeNet({
+    dns: { "acme.com": { A: ["93.184.216.34"] }, "www.acme.com": { A: ["93.184.216.34"] } },
+    pages: { "https://acme.com/": redirect("https://www.acme.com/"), "https://www.acme.com/": html(SAMPLE) },
+  });
+  const out = await safeFetchPage("acme.com", { fetchImpl: net });
+  assert.equal(out.finalUrl, "https://www.acme.com/");
+  assert.match(out.html, /Empowering/);
+});
+
+test("refuses a hostname that resolves to a private address", async () => {
+  const net = fakeNet({ dns: { "sneaky.com": { A: ["10.0.0.7"] } }, pages: { "https://sneaky.com/": html("secret") } });
+  await assert.rejects(safeFetchPage("sneaky.com", { fetchImpl: net }), { code: "blocked" });
+  assert.ok(!net.calls.includes("https://sneaky.com/"), "must not fetch the page at all");
+});
+
+test("refuses when only one of several addresses is private", async () => {
+  const net = fakeNet({ dns: { "mixed.com": { A: ["93.184.216.34"], AAAA: ["::1"] } }, pages: {} });
+  await assert.rejects(safeFetchPage("mixed.com", { fetchImpl: net }), { code: "blocked" });
+});
+
+test("refuses redirects into private space", async () => {
+  for (const target of ["http://169.254.169.254/latest/meta-data/", "http://localhost/admin", "http://inside.corp/"]) {
+    const net = fakeNet({ dns: { "bounce.com": { A: ["93.184.216.34"] } }, pages: { "https://bounce.com/": redirect(target) } });
+    await assert.rejects(safeFetchPage("bounce.com", { fetchImpl: net }), { code: "blocked" }, target);
+    assert.ok(!net.calls.includes(target));
+  }
+});
+
+test("reports unknown domains, error statuses, non-HTML and redirect loops", async () => {
+  await assert.rejects(safeFetchPage("nope-nothing.com", { fetchImpl: fakeNet({ dns: {}, pages: {} }) }), { code: "not_found" });
+
+  const dns = { "acme.com": { A: ["93.184.216.34"] } };
+  await assert.rejects(
+    safeFetchPage("acme.com", { fetchImpl: fakeNet({ dns, pages: { "https://acme.com/": html("no", 403) } }) }),
+    { code: "bad_status" },
+  );
+  await assert.rejects(
+    safeFetchPage("acme.com", {
+      fetchImpl: fakeNet({ dns, pages: { "https://acme.com/": new Response("%PDF", { headers: { "content-type": "application/pdf" } }) } }),
+    }),
+    { code: "not_html" },
+  );
+  await assert.rejects(
+    safeFetchPage("acme.com", { fetchImpl: fakeNet({ dns, pages: { "https://acme.com/": () => redirect("https://acme.com/") } }) }),
+    { code: "too_many_redirects" },
+  );
+});
+
+test("caps oversized pages", async () => {
+  const big = "<p>" + "a".repeat(3_000_000);
+  const net = fakeNet({ dns: { "big.com": { A: ["93.184.216.34"] } }, pages: { "https://big.com/": html(big) } });
+  const out = await safeFetchPage("big.com", { fetchImpl: net });
+  assert.equal(out.truncated, true);
+  assert.equal(out.html.length, 2_000_000);
+});
+
+// ---------- extraction ----------
+
+test("extracts what the auditor needs", () => {
+  const page = extractPage(SAMPLE, "https://www.acme.com/");
+  assert.equal(page.title, "Acme & Co | Solutions");
+  assert.equal(page.metaDescription, "We deliver synergy.");
+  assert.equal(page.hasOgImage, true);
+  assert.equal(page.hasViewportMeta, true);
+  assert.deepEqual(page.headings, [{ level: "h1", text: "Empowering Tomorrow" }, { level: "h2", text: "What we do" }]);
+  assert.deepEqual(page.nav, ["Home", "About"]);
+  assert.deepEqual(page.ctas, ["Learn More", "Submit"]);
+  assert.deepEqual(page.socialLinks, ["https://www.instagram.com/acme"]);
+  assert.equal(page.imageCount, 2);
+  assert.equal(page.imagesMissingAlt, 1);
+  assert.ok(page.wordCount > 60);
+  assert.doesNotMatch(page.bodyText, /do not leak|color:red|commented out/);
+  assert.equal(hasTooLittleContent(page), false);
+});
+
+test("flags empty and JavaScript-only pages", () => {
+  const shell = `<html><head><title>App</title></head><body><div id="root"></div><script src="/app.js"></script></body></html>`;
+  assert.equal(hasTooLittleContent(extractPage(shell, "https://app.com/")), true);
+  assert.equal(hasTooLittleContent(extractPage("", "https://app.com/")), true);
+});
+
+test("decodes entities without choking on junk", () => {
+  assert.equal(decodeEntities("a &amp; b &#39;c&#x27; &bogus; &#99999999;"), "a & b 'c' &bogus; &#99999999;");
+});
+
+// ---------- the whole route ----------
+
+function fakeKV() {
+  const store = new Map();
+  return {
+    store,
+    async get(key, type) {
+      const v = store.get(key);
+      return v === undefined ? null : type === "json" ? JSON.parse(v) : v;
+    },
+    async put(key, value) {
+      store.set(key, value);
+    },
+  };
+}
+
+function post(body, headers = {}) {
+  return new Request("https://ihatemybrand.com/teardown/api/audit", {
+    method: "POST",
+    headers: { "content-type": "application/json", "cf-connecting-ip": "203.0.113.9", ...headers },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+}
+
+async function withNet(net, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = net;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = real;
+  }
+}
+
+function claudeReply(input) {
+  return (init) => {
+    claudeReply.last = { headers: init.headers, body: JSON.parse(init.body) };
+    return Response.json({ content: [{ type: "tool_use", name: "free_note", input }] });
+  };
+}
+
+const GOOD_NOTE = {
+  can_audit: true,
+  problem: "Nobody can tell what you sell.",
+  why_its_costing_them: 'Your headline says "Empowering Tomorrow". That could be a bank or a gym.',
+  fix: 'Say the thing. "Payroll software for restaurants."',
+};
+
+const acmeNet = (claude) =>
+  fakeNet({
+    dns: { "acme.com": { A: ["93.184.216.34"] } },
+    pages: { "https://acme.com/": html(SAMPLE), "https://api.anthropic.com/v1/messages": claude },
+  });
+
+test("end to end: URL in, free note out, then served from cache", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", TEARDOWN_KV: fakeKV() };
+  const net = acmeNet(claudeReply(GOOD_NOTE));
+
+  const first = await withNet(net, async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+  assert.equal(first.ok, true);
+  assert.equal(first.cached, false);
+  assert.equal(first.domain, "acme.com");
+  assert.deepEqual(first.note, { problem: GOOD_NOTE.problem, why: GOOD_NOTE.why_its_costing_them, fix: GOOD_NOTE.fix });
+
+  const sent = claudeReply.last;
+  assert.equal(sent.headers["x-api-key"], "sk-test");
+  assert.equal(sent.body.tool_choice.name, "free_note");
+  assert.match(sent.body.system, /brand auditor for I Hate Social/);
+  assert.match(sent.body.messages[0].content, /MODE: FREE[\s\S]*Empowering Tomorrow/);
+
+  const before = net.calls.length;
+  const second = await withNet(net, async () => (await worker.fetch(post({ url: "https://www.acme.com/pricing" }), env, {})).json());
+  assert.equal(second.cached, true);
+  assert.equal(second.note.problem, GOOD_NOTE.problem);
+  assert.equal(net.calls.length, before, "cache hit must make no network calls");
+});
+
+test("never invents an audit", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", TEARDOWN_KV: fakeKV() };
+
+  // Auditor declines.
+  let res = await withNet(acmeNet(claudeReply({ can_audit: false, reason: "This is a parked domain page." })), () =>
+    worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal(res.status, 422);
+  assert.equal((await res.json()).error.message, "This is a parked domain page.");
+
+  // Auditor returns half an answer.
+  res = await withNet(acmeNet(claudeReply({ can_audit: true, problem: "Hm." })), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal(res.status, 502);
+
+  // Claude API is down.
+  res = await withNet(acmeNet(() => new Response("overloaded", { status: 529 })), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal(res.status, 502);
+
+  // Empty site: the auditor is never called.
+  const emptyNet = fakeNet({ dns: { "acme.com": { A: ["93.184.216.34"] } }, pages: { "https://acme.com/": html("<html><body></body></html>") } });
+  res = await withNet(emptyNet, () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal((await res.json()).error.code, "too_little_content");
+  assert.ok(!emptyNet.calls.some((u) => u.includes("anthropic")));
+
+  assert.equal([...env.TEARDOWN_KV.store.keys()].filter((k) => k.startsWith("note:")).length, 0, "failures are not cached");
+});
+
+test("rejects bad input and missing setup", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test" };
+  const none = fakeNet({ dns: {}, pages: {} });
+  const code = async (req, e = env) => (await (await withNet(none, () => worker.fetch(req, e, {}))).json()).error.code;
+
+  assert.equal(await code(post({ url: "http://169.254.169.254/" })), "blocked");
+  assert.equal(await code(post({ url: "" })), "bad_url");
+  assert.equal(await code(post({})), "bad_url");
+  assert.equal(await code(post("not json")), "bad_request");
+  assert.equal(await code(post({ url: "acme.com" }, { "content-type": "text/plain" })), "bad_request");
+  assert.equal(await code(post({ url: "acme.com" }), {}), "not_configured");
+  assert.equal(await code(new Request("https://ihatemybrand.com/teardown/api/audit")), "method_not_allowed");
+  assert.equal(none.calls.length, 0);
+});
+
+test("limits free audits per IP per day", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", TEARDOWN_KV: fakeKV() };
+  const dns = {};
+  const pages = { "https://api.anthropic.com/v1/messages": claudeReply(GOOD_NOTE) };
+  for (let i = 0; i < 6; i++) {
+    dns[`site${i}.com`] = { A: ["93.184.216.34"] };
+    pages[`https://site${i}.com/`] = () => html(SAMPLE);
+  }
+  const net = fakeNet({ dns, pages });
+  const statuses = [];
+  for (let i = 0; i < 6; i++) {
+    statuses.push((await withNet(net, () => worker.fetch(post({ url: `site${i}.com` }), env, {}))).status);
+  }
+  assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429]);
+
+  const other = await withNet(net, () => worker.fetch(post({ url: "site5.com" }, { "cf-connecting-ip": "198.51.100.4" }), env, {}));
+  assert.equal(other.status, 200, "a different visitor is not affected");
+});
+
+test("serves the page and helpers", async () => {
+  const env = { ASSETS: { fetch: async () => new Response("page") } };
+  assert.equal(await (await worker.fetch(new Request("https://x.com/teardown/"), env, {})).text(), "page");
+  const root = await worker.fetch(new Request("https://x.com/"), env, {});
+  assert.equal(root.headers.get("location"), "https://x.com/teardown/");
+  assert.equal(domainOf("https://WWW.Acme.com/pricing"), "acme.com");
+});
+
+// ---------- leads ----------
+
+import { DatabaseSync } from "node:sqlite";
+import { extractContacts } from "../src/extract.js";
+import { toCsv } from "../src/leads.js";
+
+// A stand-in for Cloudflare D1 backed by real SQLite, so the SQL itself is checked.
+function fakeD1() {
+  const db = new DatabaseSync(":memory:");
+  return {
+    rows: () => db.prepare("SELECT * FROM teardowns ORDER BY created_at").all(),
+    prepare(sql) {
+      let args = [];
+      const api = {
+        bind(...a) { args = a; return api; },
+        async run() { const r = db.prepare(sql).run(...args); return { success: true, meta: { changes: Number(r.changes) } }; },
+        async all() { return { results: db.prepare(sql).all(...args) }; },
+      };
+      return api;
+    },
+  };
+}
+
+const CONTACT_HOME = `<html><head><title>Bob's Auto</title>
+<script type="application/ld+json">{"@type":"AutoRepair","telephone":"+1-732-555-0142","email":"service@bobsauto.com"}</script>
+</head><body><h1>Quality service since 1987</h1>
+<p>${"We fix cars and trucks for people all over town every single day. ".repeat(6)}</p>
+<a href="/contact-us">Contact</a> <a href="tel:(732) 555-0142">Call</a>
+<a href="https://facebook.com/bobsauto">FB</a>
+<img src="logo@2x.png"> <p>Questions? you@example.com or name@domain.com</p>
+<a href="/cdn-cgi/l/email-protection" data-cfemail="${cf("bob@bobsauto.com")}">[email&#160;protected]</a>
+</body></html>`;
+const CONTACT_PAGE = `<html><body><h1>Contact us</h1><p>Email <a href="mailto:Hello@BobsAuto.com?subject=Hi">us</a> or call 732.555.0199. Fax 12345.</p></body></html>`;
+
+function cf(email) {
+  const key = 0x5a;
+  return [key, ...[...email].map((c) => c.charCodeAt(0) ^ key)].map((n) => n.toString(16).padStart(2, "0")).join("");
+}
+
+test("finds published contact details and ignores junk", () => {
+  const c = extractContacts(CONTACT_HOME, "https://bobsauto.com/");
+  assert.deepEqual(c.emails, ["service@bobsauto.com", "bob@bobsauto.com"]);
+  assert.deepEqual(c.phones, ["+17325550142"]);
+  assert.equal(c.contactPage, "https://bobsauto.com/contact-us");
+  const none = extractContacts(`<p>Call 2024-11-10 or order 1234567890123. <a href="https://elsewhere.com/contact">Contact</a></p>`, "https://x.com/");
+  assert.deepEqual(none, { emails: [], phones: [], contactPage: null });
+});
+
+function bobNet(claude) {
+  return fakeNet({
+    dns: { "bobsauto.com": { A: ["93.184.216.34"] } },
+    pages: {
+      "https://bobsauto.com/": () => html(CONTACT_HOME),
+      "https://bobsauto.com/contact-us": () => html(CONTACT_PAGE),
+      "https://api.anthropic.com/v1/messages": claude,
+    },
+  });
+}
+
+test("saves every teardown as a lead, with contacts, and keeps contacts out of the response", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", TEARDOWN_KV: fakeKV(), DB: fakeD1() };
+  const net = bobNet(claudeReply(GOOD_NOTE));
+  const pending = [];
+  const ctx = { waitUntil: (p) => pending.push(p) };
+
+  const res = await withNet(net, async () => {
+    const r = await worker.fetch(post({ url: "bobsauto.com" }, { "cf-ipcountry": "US" }), env, ctx);
+    await Promise.all(pending);
+    return r.json();
+  });
+  assert.equal(res.ok, true);
+  assert.match(res.leadId, /^[0-9a-f-]{36}$/);
+  assert.doesNotMatch(JSON.stringify(res), /service@|hello@|5550142|contact-us/i, "contact details never go to the visitor");
+
+  let rows = env.DB.rows();
+  assert.equal(rows.length, 1);
+  const row = rows[0];
+  assert.equal(row.id, res.leadId);
+  assert.equal(row.domain, "bobsauto.com");
+  assert.equal(row.status, "ok");
+  assert.equal(row.site_title, "Bob's Auto");
+  assert.equal(row.note_problem, GOOD_NOTE.problem);
+  assert.equal(row.note_fix, GOOD_NOTE.fix);
+  assert.equal(row.country, "US");
+  assert.deepEqual(JSON.parse(row.site_emails), ["service@bobsauto.com", "bob@bobsauto.com"]);
+  assert.deepEqual(JSON.parse(row.site_phones), ["+17325550142"]);
+  assert.equal(row.contact_page, "https://bobsauto.com/contact-us");
+  assert.deepEqual(JSON.parse(row.social_links), ["https://facebook.com/bobsauto"]);
+
+  // A second visitor entering the same site is a second lead, served from cache.
+  const again = await withNet(net, async () => (await worker.fetch(post({ url: "www.bobsauto.com" }), env, ctx)).json());
+  assert.equal(again.cached, true);
+  rows = env.DB.rows();
+  assert.equal(rows.length, 2);
+  assert.equal(rows[1].from_cache, 1);
+  assert.equal(rows[1].note_problem, GOOD_NOTE.problem);
+  assert.deepEqual(JSON.parse(rows[1].site_emails), ["service@bobsauto.com", "bob@bobsauto.com"]);
+});
+
+test("checks the contact page when the homepage has no email", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1() };
+  const bare = CONTACT_HOME.replace(/<script type="application\/ld\+json">[\s\S]*?<\/script>/, "").replace(/<a href="\/cdn-cgi[\s\S]*?<\/a>/, "");
+  const net = bobNet(claudeReply(GOOD_NOTE));
+  const home = "https://bobsauto.com/";
+  const withBare = async (url, init) => (String(url) === home ? html(bare) : net(url, init));
+  await withNet(withBare, () => worker.fetch(post({ url: "bobsauto.com" }), env, {}));
+  const row = env.DB.rows()[0];
+  assert.deepEqual(JSON.parse(row.site_emails), ["hello@bobsauto.com"]);
+  assert.deepEqual(JSON.parse(row.site_phones), ["+17325550142", "+17325550199"]);
+});
+
+test("keeps failed sites as leads, but not blocked or mistyped addresses", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1() };
+  const net = fakeNet({ dns: { "down.com": { A: ["93.184.216.34"] } }, pages: { "https://down.com/": html("no", 503) } });
+  await withNet(net, () => worker.fetch(post({ url: "down.com" }), env, {}));
+  await withNet(net, () => worker.fetch(post({ url: "http://10.0.0.1" }), env, {}));
+  await withNet(net, () => worker.fetch(post({ url: "no-such-site.com" }), env, {}));
+  const rows = env.DB.rows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].status, "bad_status");
+  assert.equal(rows[0].note_problem, null);
+});
+
+test("a storage failure never costs the visitor their note", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: { prepare() { throw new Error("db down"); } } };
+  const res = await withNet(acmeNet(claudeReply(GOOD_NOTE)), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).note.problem, GOOD_NOTE.problem);
+});
+
+function emailPost(body) {
+  return new Request("https://ihatemybrand.com/teardown/api/email", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+}
+
+test("saves the visitor's email onto their teardown", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1() };
+  const first = await withNet(acmeNet(claudeReply(GOOD_NOTE)), async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+
+  let res = await worker.fetch(emailPost({ leadId: first.leadId, email: " Owner@Acme.com " }), env, {});
+  assert.equal(res.status, 200);
+  assert.equal(env.DB.rows()[0].visitor_email, "owner@acme.com");
+
+  res = await worker.fetch(emailPost({ leadId: first.leadId, email: "not-an-email" }), env, {});
+  assert.equal((await res.json()).error.code, "bad_email");
+  res = await worker.fetch(emailPost({ leadId: "00000000-0000-4000-8000-000000000000", email: "a@b.co" }), env, {});
+  assert.equal(res.status, 404);
+  res = await worker.fetch(emailPost({ leadId: "x'; DROP TABLE teardowns;--", email: "a@b.co" }), env, {});
+  assert.equal(res.status, 400);
+  assert.equal(env.DB.rows().length, 1);
+});
+
+test("admin is locked, and shows leads safely once unlocked", async () => {
+  const db = fakeD1();
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: db, ADMIN_PASSWORD: "correct horse" };
+  const evil = { ...GOOD_NOTE, problem: '<script>alert(1)</script> "Quality"', fix: "=HYPERLINK(\"http://evil\")" };
+  await withNet(bobNet(claudeReply(evil)), () => worker.fetch(post({ url: "bobsauto.com" }), env, {}));
+
+  const get = (path, password, e = env) =>
+    worker.fetch(new Request("https://ihatemybrand.com" + path, password === undefined ? {} : { headers: { authorization: "Basic " + btoa("ned:" + password) } }), e, {});
+
+  assert.equal((await get("/teardown/admin")).status, 401);
+  assert.equal((await get("/teardown/admin", "wrong")).status, 401);
+  assert.equal((await get("/teardown/admin/leads.csv", "")).status, 401);
+  assert.equal((await get("/teardown/admin", "x", { DB: db })).status, 503, "no password set means locked, not open");
+
+  const page = await get("/teardown/admin", "correct horse");
+  assert.equal(page.status, 200);
+  assert.equal(page.headers.get("cache-control"), "no-store");
+  const body = await page.text();
+  assert.match(body, /bobsauto\.com/);
+  assert.match(body, /service@bobsauto\.com/);
+  assert.match(body, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(body, /<script>alert/);
+
+  const csv = await get("/teardown/admin/leads.csv", "correct horse");
+  assert.match(csv.headers.get("content-disposition"), /teardown-leads-.*\.csv/);
+  const text = await csv.text();
+  const [header, line] = text.trim().split("\r\n");
+  assert.match(header, /^created_at,domain,status,visitor_email,site_emails,site_phones/);
+  assert.match(line, /bobsauto\.com,ok,,service@bobsauto\.com; bob@bobsauto\.com,'\+17325550142,https:\/\/bobsauto\.com\/contact-us/);
+  assert.match(line, /"'=HYPERLINK\(""http:\/\/evil""\)"/, "formulas are defused");
+
+  assert.equal(toCsv([]).trim().split(",").length, 21);
+});
+
+// ---------- back office ----------
+
+import { outreachMailto } from "../src/admin.js";
+
+const USERS = "ned:nedpass-1, brian:brianpass-2";
+const ORIGIN = "https://ihatemybrand.com";
+const basic = (user, pw) => ({ authorization: "Basic " + btoa(user + ":" + pw) });
+
+function admin(env, path, { user = "ned", pw = "nedpass-1", body, origin = ORIGIN, type = "application/json" } = {}) {
+  const headers = { ...basic(user, pw) };
+  const init = { headers };
+  if (body !== undefined) {
+    init.method = "POST";
+    init.body = JSON.stringify(body);
+    if (origin) headers.origin = origin;
+    if (type) headers["content-type"] = type;
+  }
+  return worker.fetch(new Request(ORIGIN + path, init), env, {});
+}
+
+async function seeded() {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1(), ADMIN_USERS: USERS };
+  await withNet(bobNet(claudeReply(GOOD_NOTE)), () => worker.fetch(post({ url: "bobsauto.com" }), env, {}));
+  await withNet(acmeNet(claudeReply(GOOD_NOTE)), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  const rows = env.DB.rows();
+  return { env, bob: rows.find((r) => r.domain === "bobsauto.com"), acme: rows.find((r) => r.domain === "acme.com") };
+}
+
+test("each founder signs in with their own password", async () => {
+  const { env } = await seeded();
+  assert.equal((await admin(env, "/teardown/admin")).status, 200);
+  assert.match(await (await admin(env, "/teardown/admin", { user: "Brian", pw: "brianpass-2" })).text(), /Signed in as Brian/);
+  assert.equal((await admin(env, "/teardown/admin", { user: "ned", pw: "brianpass-2" })).status, 401, "no borrowing passwords");
+  assert.equal((await admin(env, "/teardown/admin", { user: "mallory", pw: "nedpass-1" })).status, 401);
+  assert.equal((await admin(env, "/teardown/admin", { user: "ned", pw: "" })).status, 401);
+  assert.equal((await worker.fetch(new Request(ORIGIN + "/teardown/admin"), env, {})).status, 401);
+  assert.equal((await worker.fetch(new Request(ORIGIN + "/teardown/admin"), { DB: env.DB }, {})).status, 503);
+});
+
+test("works a lead: stage, owner, notes, stamped with who did it", async () => {
+  const { env, bob } = await seeded();
+  let res = await admin(env, "/teardown/admin/api/lead", { user: "brian", pw: "brianpass-2", body: { id: bob.id, stage: "contacted", owner: "Ned", notes: "Called, left voicemail" } });
+  assert.deepEqual(await res.json(), { ok: true });
+  const row = env.DB.rows().find((r) => r.id === bob.id);
+  assert.equal(row.stage, "contacted");
+  assert.equal(row.owner, "ned");
+  assert.equal(row.admin_notes, "Called, left voicemail");
+  assert.equal(row.updated_by, "brian");
+  assert.ok(row.updated_at);
+
+  res = await admin(env, "/teardown/admin/api/lead", { body: { id: bob.id, stage: "hacked" } });
+  assert.equal(res.status, 400);
+  res = await admin(env, "/teardown/admin/api/lead", { body: { id: "11111111-1111-4111-8111-111111111111", stage: "won" } });
+  assert.equal(res.status, 404);
+  assert.equal(env.DB.rows().find((r) => r.id === bob.id).stage, "contacted");
+
+  const page = await (await admin(env, "/teardown/admin")).text();
+  assert.match(page, /<option value="contacted" selected>/);
+  assert.match(page, /Called, left voicemail/);
+  assert.match(page, /Changed by Brian/);
+});
+
+test("refuses changes that don't come from the admin page itself", async () => {
+  const { env, bob } = await seeded();
+  const change = { id: bob.id, stage: "won" };
+  assert.equal((await admin(env, "/teardown/admin/api/lead", { body: change, origin: "https://evil.example" })).status, 403);
+  assert.equal((await admin(env, "/teardown/admin/api/lead", { body: change, origin: null })).status, 403);
+  assert.equal((await admin(env, "/teardown/admin/api/delete", { body: { id: bob.id }, type: "text/plain" })).status, 403);
+  assert.equal((await admin(env, "/teardown/admin/api/delete", { body: { id: bob.id }, pw: "wrong" })).status, 401);
+  const row = env.DB.rows().find((r) => r.id === bob.id);
+  assert.equal(row.stage, "new");
+});
+
+test("filters, searches, counts and exports", async () => {
+  const { env, bob } = await seeded();
+  await admin(env, "/teardown/admin/api/lead", { body: { id: bob.id, stage: "won" } });
+
+  const text = async (path) => (await admin(env, path)).text();
+  const shows = (page, domain) => new RegExp(`data-domain="${domain.replace(".", "\\.")}"`).test(page);
+
+  let page = await text("/teardown/admin");
+  assert.ok(shows(page, "bobsauto.com") && shows(page, "acme.com"));
+  assert.match(page, /<b>2<\/b>all time/);
+  assert.match(page, /<b>1<\/b>with a way to reach them/);
+  assert.match(page, /<b>1<\/b>won/);
+
+  page = await text("/teardown/admin?stage=won");
+  assert.ok(shows(page, "bobsauto.com") && !shows(page, "acme.com"));
+  page = await text("/teardown/admin?reachable=1");
+  assert.ok(shows(page, "bobsauto.com") && !shows(page, "acme.com"));
+  page = await text("/teardown/admin?q=ACME");
+  assert.ok(!shows(page, "bobsauto.com") && shows(page, "acme.com"));
+  page = await text("/teardown/admin?q=service%40bobs");
+  assert.ok(shows(page, "bobsauto.com") && !shows(page, "acme.com"));
+  page = await text("/teardown/admin?q=%25");
+  assert.ok(!shows(page, "bobsauto.com") && !shows(page, "acme.com"), "% is a plain character, not a wildcard");
+  page = await text("/teardown/admin?q=%22%3E%3Cscript%3Ex");
+  assert.doesNotMatch(page, /"><script>x/);
+
+  const csv = await text("/teardown/admin/leads.csv?stage=won");
+  const lines = csv.trim().split("\r\n");
+  assert.equal(lines.length, 2);
+  assert.match(lines[0], /country,stage,owner,admin_notes,prompt_version,id$/);
+  assert.match(lines[1], /,won,,,0,[0-9a-f-]{36}$/);
+});
+
+test("deletes a lead for good", async () => {
+  const { env, bob } = await seeded();
+  assert.deepEqual(await (await admin(env, "/teardown/admin/api/delete", { body: { id: bob.id } })).json(), { ok: true });
+  assert.deepEqual(env.DB.rows().map((r) => r.domain), ["acme.com"]);
+  assert.equal((await admin(env, "/teardown/admin/api/delete", { body: { id: bob.id } })).status, 404);
+});
+
+test("pause switch and daily limit control the public teardown", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1(), TEARDOWN_KV: fakeKV(), ADMIN_USERS: USERS };
+  const dns = {};
+  const pages = { "https://api.anthropic.com/v1/messages": claudeReply(GOOD_NOTE) };
+  for (let i = 0; i < 4; i++) {
+    dns[`shop${i}.com`] = { A: ["93.184.216.34"] };
+    pages[`https://shop${i}.com/`] = () => html(SAMPLE);
+  }
+  const net = fakeNet({ dns, pages });
+  const run = (i) => withNet(net, () => worker.fetch(post({ url: `shop${i}.com` }), env, {}));
+
+  assert.equal((await admin(env, "/teardown/admin/api/settings", { body: { dailyLimit: 0 } })).status, 400);
+  assert.equal((await admin(env, "/teardown/admin/api/settings", { body: { dailyLimit: 2 } })).status, 200);
+  assert.deepEqual([(await run(0)).status, (await run(1)).status, (await run(2)).status], [200, 200, 429]);
+
+  const paused = await (await admin(env, "/teardown/admin/api/settings", { body: { paused: true } })).json();
+  assert.deepEqual(paused.settings, { paused: true, dailyLimit: 2 });
+  const calls = net.calls.length;
+  const blocked = await run(3);
+  assert.equal(blocked.status, 503);
+  assert.equal((await blocked.json()).error.code, "paused");
+  assert.equal(net.calls.length, calls, "nothing is fetched or spent while paused");
+  assert.equal((await run(0)).status, 200, "sites already audited today still load from cache");
+  assert.match(await (await admin(env, "/teardown/admin")).text(), /id="paused" checked/);
+
+  await admin(env, "/teardown/admin/api/settings", { body: { paused: false, dailyLimit: 10 } });
+  assert.equal((await run(3)).status, 200);
+});
+
+test("drafts an outreach email, and never for do-not-contact leads", async () => {
+  const { env, bob, acme } = await seeded();
+  const link = outreachMailto(bob, "brian");
+  assert.match(link, /^mailto:service%40bobsauto\.com\?subject=/);
+  const body = decodeURIComponent(link.split("&body=")[1]);
+  assert.match(body, /Someone ran bobsauto\.com through our free Brand Teardown/);
+  assert.match(body, /Nobody can tell what you sell\./);
+  assert.match(body, /Reply and say so, and we won't email again\./);
+  assert.match(body, /Brian\nI Hate My Brand$/);
+  assert.ok(link.length < 2100, "short enough for mail apps");
+
+  assert.match(outreachMailto({ ...bob, visitor_email: "owner@bobsauto.com" }, "ned"), /^mailto:owner%40bobsauto\.com/);
+  assert.match(decodeURIComponent(outreachMailto({ ...bob, visitor_email: "owner@bobsauto.com" }, "ned")), /You ran bobsauto\.com/);
+  assert.equal(outreachMailto(acme, "ned"), null, "no address, no email button");
+  assert.equal(outreachMailto({ ...bob, stage: "do_not_contact" }, "ned"), null);
+
+  await admin(env, "/teardown/admin/api/lead", { body: { id: bob.id, stage: "do_not_contact" } });
+  assert.doesNotMatch(await (await admin(env, "/teardown/admin")).text(), /data-action="email"/);
+});
+
+test("adds the new columns to a database created by the first version", async () => {
+  const db = fakeD1();
+  await db.prepare(`CREATE TABLE teardowns (id TEXT PRIMARY KEY, created_at TEXT NOT NULL, input_url TEXT NOT NULL, final_url TEXT,
+    domain TEXT NOT NULL, tier TEXT NOT NULL DEFAULT 'free', status TEXT NOT NULL, from_cache INTEGER NOT NULL DEFAULT 0, site_title TEXT,
+    note_problem TEXT, note_why TEXT, note_fix TEXT, visitor_email TEXT, site_emails TEXT, site_phones TEXT, contact_page TEXT,
+    social_links TEXT, country TEXT)`).run();
+  await db.prepare(`INSERT INTO teardowns (id, created_at, input_url, domain, status) VALUES ('old', '2026-11-01T00:00:00Z', 'https://old.com/', 'old.com', 'ok')`).run();
+  const env = { DB: db, ADMIN_USERS: USERS };
+  const page = await (await admin(env, "/teardown/admin")).text();
+  assert.match(page, /data-domain="old\.com"/);
+  assert.equal(db.rows()[0].stage, "new");
+});
+
+// ---------- auditor prompt ----------
+
+test("edits the auditor prompt, versions it, and uses it on the next teardown", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1(), TEARDOWN_KV: fakeKV(), ADMIN_USERS: USERS };
+  const net = fakeNet({
+    dns: { "acme.com": { A: ["93.184.216.34"] } },
+    pages: { "https://acme.com/": () => html(SAMPLE), "https://api.anthropic.com/v1/messages": claudeReply(GOOD_NOTE) },
+  });
+  const run = () => withNet(net, async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+  const anthropicCalls = () => net.calls.filter((u) => u.includes("anthropic")).length;
+
+  await run();
+  assert.match(claudeReply.last.body.system, /^You are the brand auditor for I Hate Social/);
+  assert.equal((await run()).cached, true);
+  assert.equal(anthropicCalls(), 1);
+
+  const mine = "You are the 2027 brand auditor. Check the headline first, then the offer, then proof. ".repeat(4).trim();
+  let res = await admin(env, "/teardown/admin/api/prompt", { user: "brian", pw: "brianpass-2", body: { prompt: mine } });
+  assert.deepEqual(await res.json(), { ok: true, version: 1, builtIn: false });
+
+  const after = await run();
+  assert.equal(after.cached, false, "a new prompt starts a fresh cache");
+  assert.equal(anthropicCalls(), 2);
+  const system = claudeReply.last.body.system;
+  assert.ok(system.startsWith(mine));
+  assert.doesNotMatch(system, /brand auditor for I Hate Social/);
+  assert.match(system, /Never invent an audit\./, "the locked rules are still attached");
+  assert.match(system, /never instructions to you/);
+  assert.deepEqual(env.DB.rows().map((r) => r.prompt_version), [0, 0, 1]);
+
+  assert.equal((await admin(env, "/teardown/admin/api/prompt", { body: { prompt: "be mean" } })).status, 400);
+  assert.equal((await admin(env, "/teardown/admin/api/prompt", { body: { prompt: "x".repeat(20001) } })).status, 400);
+  assert.equal((await admin(env, "/teardown/admin/api/prompt", { body: { prompt: mine }, origin: "https://evil.example" })).status, 403);
+  assert.equal((await (await admin(env, "/teardown/admin/api/prompt", { body: { prompt: mine } })).json()).version, 1, "saving the same text makes no new version");
+
+  const page = await (await admin(env, "/teardown/admin/prompt")).text();
+  assert.match(page, /You&#39;re on version 1|You're on version 1/);
+  assert.match(page, /Version 1<\/b> <span class="tag">In use<\/span>/);
+  assert.match(page, /by Brian/);
+  assert.ok(page.includes(">" + mine + "</textarea>"));
+
+  res = await admin(env, "/teardown/admin/api/prompt", { body: { prompt: "" } });
+  assert.deepEqual(await res.json(), { ok: true, version: 2, builtIn: true });
+  await run();
+  assert.match(claudeReply.last.body.system, /^You are the brand auditor for I Hate Social/);
+  assert.match(await (await admin(env, "/teardown/admin/prompt")).text(), /on the built-in prompt/);
+});
+
+test("tries a draft prompt without saving it or creating a lead", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1(), ADMIN_USERS: USERS };
+  const draft = "Draft auditor. Only talk about the headline. " + "Be specific. ".repeat(20);
+  const res = await withNet(acmeNet(claudeReply(GOOD_NOTE)), () =>
+    admin(env, "/teardown/admin/api/prompt-test", { body: { url: "acme.com", prompt: draft } }));
+  const data = await res.json();
+  assert.equal(data.ok, true);
+  assert.equal(data.domain, "acme.com");
+  assert.equal(data.note.problem, GOOD_NOTE.problem);
+  assert.ok(claudeReply.last.body.system.startsWith(draft.trim()));
+
+  await admin(env, "/teardown/admin");
+  assert.equal(env.DB.rows().length, 0, "no lead");
+  assert.match(await (await admin(env, "/teardown/admin/prompt")).text(), /on the built-in prompt/, "not saved");
+
+  const blocked = await withNet(fakeNet({ dns: {}, pages: {} }), () =>
+    admin(env, "/teardown/admin/api/prompt-test", { body: { url: "http://169.254.169.254/", prompt: draft } }));
+  assert.equal(blocked.status, 400, "the same address rules apply to admins");
+  const escaped = await (await admin(env, "/teardown/admin/prompt")).text();
+  assert.doesNotMatch(escaped, /<textarea[^>]*>[^<]*<script/);
+});

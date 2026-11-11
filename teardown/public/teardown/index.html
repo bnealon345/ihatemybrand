@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brand Teardown | I Hate My Brand</title>
+<meta name="description" content="Drop your website. We'll tell you the biggest thing that's broken with your brand, and how to fix it. Free.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,800&family=Instrument+Serif:ital@1&family=Inter:wght@400;600&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  /* Matched by eye to a screenshot of ihatemybrand.com. Fonts are a best guess:
+     swap the names here (and the font link above) for the site's real ones. */
+  :root {
+    --bg: #0b1a33;
+    --ink: #f4f5f7;
+    --muted: #b4c3de;
+    --line: #27385b;
+    --accent: #e4ec66;
+    --accent-ink: #0b1a33;
+    --font-display: "Bricolage Grotesque", "Arial Black", "Helvetica Neue", Impact, sans-serif;
+    --font-body: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    --font-serif: "Instrument Serif", Georgia, "Times New Roman", serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 17px/1.5 var(--font-body);
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+  main { flex: 1; width: 100%; max-width: 680px; margin: 0 auto; padding: 28px 16px 48px; }
+  .brand { font: 800 18px/1 var(--font-display); font-stretch: 85%; letter-spacing: .01em; text-transform: uppercase; color: var(--ink); text-decoration: none; }
+  .brand span { color: var(--accent); }
+  h1 {
+    font: 800 clamp(44px, 13vw, 84px)/.9 var(--font-display); font-stretch: 80%;
+    letter-spacing: -.02em; text-transform: uppercase; margin: 14px 0 0;
+  }
+  h1 em { font-style: normal; color: var(--accent); }
+  .eyebrow { font: 500 12px/1.4 var(--font-mono); letter-spacing: .22em; text-transform: uppercase; color: var(--muted); margin: 48px 0 0; }
+  .tagline { font: italic 400 clamp(26px, 7.5vw, 40px)/1.1 var(--font-serif); color: var(--accent); margin: 16px 0 0; padding-top: 14px; position: relative; }
+  .tagline::before { content: ""; position: absolute; top: 0; left: 0; width: min(60%, 300px); height: 8px; background: var(--accent); }
+  .lede { color: var(--ink); font-size: 18px; margin: 26px 0 26px; max-width: 30em; }
+  form { display: flex; flex-direction: column; gap: 10px; }
+  label.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  input.field {
+    width: 100%; padding: 16px; font: inherit; font-size: 18px; color: var(--ink);
+    background: transparent; border: 2px solid var(--muted); border-radius: 999px; padding-left: 22px; outline: none;
+  }
+  input.field::placeholder { color: var(--muted); }
+  input.field:focus { border-color: var(--accent); outline: 3px solid var(--muted); outline-offset: 2px; }
+  button, .button {
+    display: inline-block; width: 100%; padding: 17px 20px; cursor: pointer; text-align: center;
+    font: 600 17px/1 var(--font-body); text-decoration: none;
+    color: var(--accent-ink); background: var(--accent); border: 2px solid var(--accent); border-radius: 999px;
+  }
+  button:disabled { opacity: .55; cursor: wait; }
+  button:focus-visible, .button:focus-visible, a:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+  @media (min-width: 560px) {
+    form { flex-direction: row; }
+    form button { width: auto; white-space: nowrap; }
+  }
+  .status { min-height: 1.5em; margin: 16px 0 0; color: var(--muted); }
+  .status.error { color: var(--ink); border-left: 6px solid var(--accent); padding: 4px 0 4px 12px; }
+  [hidden] { display: none !important; }
+
+  .note { margin-top: 40px; border-top: 2px solid var(--ink); padding-top: 22px; }
+  .kicker { font: 500 12px/1 var(--font-mono); letter-spacing: .18em; text-transform: uppercase; color: var(--accent); margin: 0 0 12px; }
+  .domain { color: var(--muted); font-size: 14px; margin: 0 0 6px; word-break: break-all; }
+  .problem { font: 800 clamp(28px, 8vw, 44px)/1 var(--font-display); font-stretch: 85%; letter-spacing: -.01em; margin: 0 0 26px; }
+  .note h3 { font: 500 12px/1 var(--font-mono); letter-spacing: .18em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+  .note p.body { margin: 0 0 24px; white-space: pre-wrap; }
+  .fix { border: 2px solid var(--line); border-radius: 18px; padding: 18px; margin-bottom: 28px; }
+  .fix p.body { margin: 0; }
+  .follow { display: block; margin: 0 0 28px; }
+  .follow label { display: block; margin-bottom: 10px; font-weight: 600; }
+  .follow .row { display: flex; flex-direction: column; gap: 10px; }
+  .follow .status { margin-top: 10px; }
+  @media (min-width: 560px) { .follow .row { flex-direction: row; } .follow .row button { width: auto; white-space: nowrap; } }
+  .fixit { border-top: 2px solid var(--line); padding-top: 24px; }
+  .fixit p { margin: 0 0 14px; }
+  .again { display: inline-block; margin-top: 18px; color: var(--muted); font-size: 15px; }
+  .assure { list-style: none; display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 14px 0 0; padding: 0; color: var(--muted); font-size: 14px; }
+  .assure li::before { content: "\2713\00a0"; color: var(--ink); }
+  .pitch { margin-top: 52px; }
+  .pitch > h2 { font: 800 clamp(28px, 8vw, 42px)/.95 var(--font-display); font-stretch: 80%; letter-spacing: -.01em; text-transform: uppercase; margin: 0 0 10px; }
+  .pitch > p { color: var(--muted); margin: 0 0 20px; max-width: 32em; }
+  .sample { border: 2px solid var(--line); border-radius: 18px; padding: 20px 18px; position: relative; }
+  .sample .tag { display: inline-block; border-radius: 999px; font: 500 11px/1 var(--font-mono); letter-spacing: .18em; text-transform: uppercase; color: var(--accent-ink); background: var(--accent); padding: 6px 8px; margin: 0 0 14px; }
+  .sample .problem { font-size: clamp(21px, 6vw, 28px); margin-bottom: 18px; }
+  .sample h3 { font: 500 12px/1 var(--font-mono); letter-spacing: .18em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
+  .sample p.body { margin: 0 0 16px; }
+  .sample p.body:last-of-type { margin-bottom: 0; }
+  .sample .madeup { color: var(--muted); font: italic 400 18px/1.3 var(--font-serif); margin: 16px 0 0; }
+  .checks { list-style: none; margin: 0; padding: 0; counter-reset: c; }
+  .checks li { counter-increment: c; display: grid; grid-template-columns: 2.2em 1fr; padding: 14px 0; border-top: 1px solid var(--line); }
+  .checks li::before { content: counter(c); font: 800 22px/1.15 var(--font-display); color: var(--accent); }
+  .checks b { display: block; }
+  .checks span { color: var(--muted); font-size: 15px; }
+  .proof { margin-top: 44px; padding-top: 20px; border-top: 2px solid var(--line); color: var(--muted); font-size: 15px; }
+  .proof b { color: var(--ink); font-weight: 600; }
+  .backtop { margin-top: 28px; }
+  footer { max-width: 680px; width: 100%; margin: 0 auto; padding: 20px 16px 28px; color: var(--muted); font-size: 13px; line-height: 1.45; border-top: 1px solid var(--line); }
+  footer p { margin: 0 0 6px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .note { animation: rise .35s ease-out; }
+    @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+  }
+</style>
+</head>
+<body>
+<main>
+  <a class="brand" href="/">I <span>Hate</span> My Brand</a>
+
+  <p class="eyebrow">Free brand teardown &middot; From I Hate My Brand</p>
+  <h1>Drop your website. We'll tell you <em>what's broken.</em></h1>
+  <p class="tagline">It's free. It might sting.</p>
+  <p class="lede">You know it's bad. So do your customers. Get one brutally honest note on the biggest problem with your brand, and exactly how to fix it.</p>
+
+  <form id="form" novalidate>
+    <label class="sr" for="url">Your website address</label>
+    <input id="url" class="field" name="url" type="text" inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" placeholder="yourbrand.com" required>
+    <button id="go" type="submit">Tear it down</button>
+  </form>
+  <ul class="assure" id="assure">
+    <li>Free</li><li>No email needed</li><li>No sales call</li><li>About 20 seconds</li>
+  </ul>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+
+  <section id="note" class="note" hidden aria-labelledby="problem">
+    <p class="kicker">Your free note</p>
+    <p id="domain" class="domain"></p>
+    <h2 id="problem" class="problem" tabindex="-1"></h2>
+
+    <h3>Why it's costing you</h3>
+    <p id="why" class="body"></p>
+
+    <div class="fix">
+      <h3>The fix</h3>
+      <p id="fix" class="body"></p>
+    </div>
+
+    <form id="emailform" class="follow" novalidate>
+      <label for="email">Want us to take a closer look? Leave your email and one of us will follow up.</label>
+      <div class="row">
+        <input id="email" class="field" name="email" type="email" inputmode="email" autocomplete="email" autocapitalize="none" spellcheck="false" placeholder="you@yourbrand.com">
+        <button id="emailgo" type="submit">Send</button>
+      </div>
+      <p id="emailstatus" class="status" role="status" aria-live="polite"></p>
+    </form>
+
+    <div class="fixit">
+      <p>That's one problem. Want it gone, along with the rest?</p>
+      <!-- PLACEHOLDER: Brian's booking link goes in this href. -->
+      <a id="book" class="button" href="#booking-link-placeholder">Have us fix it</a>
+      <br>
+      <a class="again" href="#" id="again">Tear down another site</a>
+    </div>
+  </section>
+
+  <div id="pitch">
+    <section class="pitch" aria-labelledby="sample-h">
+      <h2 id="sample-h">Here's what you get.</h2>
+      <p>One note. The thing that's costing you the most, in plain words, with the fix written out.</p>
+      <div class="sample">
+        <p class="tag">Sample note</p>
+        <p class="domain">bobsautorepair.example</p>
+        <p class="problem">Your homepage says "Quality service since 1987." So does every other shop in town.</p>
+        <h3>Why it's costing you</h3>
+        <p class="body">A stranger can't tell what you fix, where you are, or why they'd pick you over the shop down the road. Your phone number is at the bottom of the page. People with a dead car don't scroll.</p>
+        <h3>The fix</h3>
+        <p class="body">Lead with the job and the town: "Brakes, tires and engine work in Springfield. Most repairs done same day." Then put the phone number top right, big enough to tap with a thumb.</p>
+        <p class="madeup">(Bob's Auto Repair is made up. Your note will be about your site.)</p>
+      </div>
+    </section>
+
+    <section class="pitch" aria-labelledby="checks-h">
+      <h2 id="checks-h">We read it like a stranger.</h2>
+      <p>People decide if you're legit in about two seconds. So that's how we look at your site.</p>
+      <ol class="checks">
+        <li><div><b>The 5 second test</b><span>Can someone who has never heard of you tell what you do?</span></div></li>
+        <li><div><b>The words</b><span>Does your headline say something, or does it just sound like something?</span></div></li>
+        <li><div><b>The ask</b><span>Is it obvious what to buy, and what to click to buy it?</span></div></li>
+      </ol>
+    </section>
+
+    <p class="proof">From the two people behind the brand work for <b>Saquon Barkley's Alpha Invitational</b>, the <b>Hurdles for Hope Gala</b> at the Philadelphia Museum of Art, and a <b>Mastercard CMO's newsletter</b> with 100K+ subscribers.</p>
+
+    <a class="button backtop" href="#url" id="backtop">Tear mine down</a>
+  </div>
+</main>
+
+<footer>
+  <p>This audit is our opinion, based on what's publicly on your site. It's not a guarantee of results.</p>
+  <p>Privacy: we read the public pages at the address you give us. We keep that address, the audit, and the public contact details listed on the site, and we may get in touch about fixing what we found. We don't sell any of it.</p>
+</footer>
+
+<script>
+(function () {
+  var form = document.getElementById("form");
+  var input = document.getElementById("url");
+  var go = document.getElementById("go");
+  var status = document.getElementById("status");
+  var note = document.getElementById("note");
+  var waiting = [
+    "Loading your homepage.",
+    "Reading it like a stranger with 5 seconds.",
+    "Looking for what you actually sell.",
+    "Picking the one thing that hurts most."
+  ];
+  var pitch = document.getElementById("pitch");
+  var emailForm = document.getElementById("emailform");
+  var emailInput = document.getElementById("email");
+  var emailGo = document.getElementById("emailgo");
+  var emailStatus = document.getElementById("emailstatus");
+  var leadId = null;
+  var timer = null;
+
+  function setStatus(text, isError) {
+    status.textContent = text;
+    status.className = "status" + (isError ? " error" : "");
+  }
+
+  function setBusy(busy) {
+    go.disabled = busy;
+    go.textContent = busy ? "Tearing it down" : "Tear it down";
+    clearInterval(timer);
+    if (busy) {
+      var i = 0;
+      setStatus(waiting[0], false);
+      timer = setInterval(function () {
+        i = Math.min(i + 1, waiting.length - 1);
+        setStatus(waiting[i], false);
+      }, 4000);
+    }
+  }
+
+  function show(data) {
+    // textContent only: nothing the auditor or the audited site says is ever treated as HTML.
+    document.getElementById("domain").textContent = data.domain;
+    document.getElementById("problem").textContent = data.note.problem;
+    document.getElementById("why").textContent = data.note.why;
+    document.getElementById("fix").textContent = data.note.fix;
+    leadId = data.leadId || null;
+    emailForm.hidden = !leadId;
+    emailInput.value = "";
+    emailInput.disabled = false;
+    emailGo.disabled = false;
+    emailStatus.textContent = "";
+    emailStatus.className = "status";
+    note.hidden = false;
+    pitch.hidden = true;
+    setStatus("", false);
+    document.getElementById("problem").focus({ preventScroll: true });
+    note.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var value = input.value.trim();
+    if (!value) { setStatus("Give us a website first.", true); input.focus(); return; }
+    note.hidden = true;
+    setBusy(true);
+
+    fetch("/teardown/api/audit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: value })
+    })
+      .then(function (res) { return res.json().catch(function () { return null; }); })
+      .then(function (data) {
+        setBusy(false);
+        if (data && data.ok && data.note) return show(data);
+        setStatus((data && data.error && data.error.message) || "Something broke on our end. Try again in a minute.", true);
+      })
+      .catch(function () {
+        setBusy(false);
+        setStatus("We couldn't reach our own server. Check your connection and try again.", true);
+      });
+  });
+
+  emailForm.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var value = emailInput.value.trim();
+    function say(text, isError) {
+      emailStatus.textContent = text;
+      emailStatus.className = "status" + (isError ? " error" : "");
+    }
+    if (!value) { say("Type your email first.", true); emailInput.focus(); return; }
+    emailGo.disabled = true;
+    fetch("/teardown/api/email", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ leadId: leadId, email: value })
+    })
+      .then(function (res) { return res.json().catch(function () { return null; }); })
+      .then(function (data) {
+        if (data && data.ok) { emailInput.disabled = true; say("Got it. We'll be in touch.", false); return; }
+        emailGo.disabled = false;
+        say((data && data.error && data.error.message) || "That didn't save. Try again.", true);
+      })
+      .catch(function () { emailGo.disabled = false; say("That didn't save. Check your connection and try again.", true); });
+  });
+
+  // The homepage box hands a site over as /teardown/?url=yourbrand.com and we start right away.
+  try {
+    var handed = new URLSearchParams(window.location.search).get("url");
+    if (handed) {
+      input.value = handed.slice(0, 2000);
+      window.history.replaceState(null, "", window.location.pathname);
+      if (form.requestSubmit) form.requestSubmit(); else go.click();
+    }
+  } catch (e) { /* no prefill, the box still works */ }
+
+  document.getElementById("backtop").addEventListener("click", function (event) {
+    event.preventDefault();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    input.focus({ preventScroll: true });
+  });
+
+  document.getElementById("again").addEventListener("click", function (event) {
+    event.preventDefault();
+    note.hidden = true;
+    pitch.hidden = false;
+    input.value = "";
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    input.focus();
+  });
+})();
+</script>
+</body>
+</html>

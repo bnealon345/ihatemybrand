@@ -1,0 +1,6 @@
+# Copy to .dev.vars for local runs. Never commit the real file.
+ANTHROPIC_API_KEY=your-key-here
+# One login per person. Passwords can't contain a comma.
+ADMIN_USERS=ned:pick-a-long-password,brian:pick-another-one
+# Optional. Defaults to claude-sonnet-5-5.
+# CLAUDE_MODEL=claude-sonnet-5-5

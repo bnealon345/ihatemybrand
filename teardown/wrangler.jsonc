@@ -1,0 +1,25 @@
+{
+  "name": "ihmb-teardown",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "observability": { "enabled": true },
+
+  // Serves this app at ihatemybrand.com/teardown. Everything else on the domain stays with the main site.
+  "routes": [
+    { "pattern": "ihatemybrand.com/teardown*", "zone_name": "ihatemybrand.com" },
+    { "pattern": "www.ihatemybrand.com/teardown*", "zone_name": "ihatemybrand.com" }
+  ],
+
+  // Leads, settings and auditor prompt versions. Created in the Cloudflare account on 2026-11-10.
+  "d1_databases": [
+    { "binding": "DB", "database_name": "ihmb-teardown", "database_id": "90499b23-3f25-4ad9-b5d9-8e38511ccc5e" }
+  ],
+
+  // 24 hour cache per domain and the free-teardown daily limit. Created the same day.
+  "kv_namespaces": [{ "binding": "TEARDOWN_KV", "id": "4b9be34c809a4bec800d7ae6a62d763c" }]
+
+  // Secrets are not in this file. Set them once in Cloudflare:
+  //   ANTHROPIC_API_KEY   the Claude API key
+  //   ADMIN_USERS         ned:a-long-password,brian:another-long-password
+}
