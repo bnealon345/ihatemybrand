@@ -5,6 +5,9 @@
 //   POST /teardown/admin/api/lead      { id, stage?, owner?, notes? }
 //   POST /teardown/admin/api/delete    { id }
 //   POST /teardown/admin/api/settings  { paused?, dailyLimit? }
+//   GET  /teardown/admin/lead/<id>     one teardown in full: screenshot, the whole note, contacts, pipeline
+//   POST /teardown/admin/api/delete-many  { ids }
+//   POST /teardown/admin/api/test-run     { url }   a full teardown that skips the daily limit and is filed under Tests
 //   GET  /teardown/admin/prompt        edit the auditor prompt, try it on a site, see past versions
 //   POST /teardown/admin/api/prompt       { prompt }   ("" goes back to the built-in prompt)
 //   POST /teardown/admin/api/prompt-test  { url, prompt }   runs a draft without saving anything
@@ -14,12 +17,13 @@
 // (ADMIN_PASSWORD alone still works: one shared password, any username.)
 
 import {
-  STAGES, listLeads, leadStats, updateLead, deleteLead, getSettings, saveSettings, parseList, toCsv,
+  STAGES, listLeads, leadStats, updateLead, deleteLead, deleteLeads, getLead, insertLead, getSettings, saveSettings, parseList, toCsv,
   getActivePrompt, savePrompt, listPromptVersions, PROMPT_MAX,
 } from "./leads.js";
 import { AUDITOR_PROMPT, runFreeAudit } from "./audit.js";
 import { TeardownError, normalizeUrl, safeFetchPage } from "./safe-fetch.js";
-import { extractPage, hasTooLittleContent } from "./extract.js";
+import { extractPage, extractContacts, hasTooLittleContent } from "./extract.js";
+import { takeScreenshot, saveScreenshot } from "./shot.js";
 
 const PRIVATE_HEADERS = { "cache-control": "no-store", "x-robots-tag": "noindex, nofollow" };
 const STAGE_LABELS = {
@@ -155,6 +159,7 @@ function queryString(filters, changes = {}) {
   if (merged.stage) params.set("stage", merged.stage);
   if (merged.q) params.set("q", merged.q);
   if (merged.reachable) params.set("reachable", "1");
+  if (merged.tests) params.set("tests", "1");
   const s = params.toString();
   return s ? "?" + s : "";
 }
@@ -195,7 +200,7 @@ const CSS = `
   .link { background: none; border: 0; padding: 6px 0; font: inherit; color: #b4c3de; text-decoration: underline; cursor: pointer; }
   .link.danger:hover { color: #ff9d8a; }
   .wrap { overflow-x: auto; border: 1px solid #27385b; border-radius: 14px; }
-  table { border-collapse: collapse; width: 100%; min-width: 1040px; }
+  table { border-collapse: collapse; width: 100%; min-width: 1100px; }
   th, td { text-align: left; vertical-align: top; padding: 12px; border-bottom: 1px solid #27385b; }
   tr:last-child td { border-bottom: 0; }
   th { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #b4c3de; }
@@ -224,6 +229,25 @@ const CSS = `
   .versions { list-style: none; margin: 0; padding: 0; }
   .versions li { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: space-between; padding: 10px 0; border-top: 1px solid #27385b; }
   .versions li:first-child { border-top: 0; }
+  .thumb { display: block; width: 120px; height: auto; margin-top: 8px; border-radius: 6px; border: 1px solid #27385b; }
+  .headline { display: block; color: #f4f5f7; font-weight: 600; text-decoration: none; margin-bottom: 4px; }
+  .headline:hover { text-decoration: underline; }
+  .lead h2 { margin-top: 26px; }
+  .lead p { margin: 0 0 12px; font-size: 16px; line-height: 1.55; }
+  .big { font-size: 26px !important; line-height: 1.2 !important; font-weight: 700; margin: 18px 0 0 !important; }
+  .shotbox { margin: 0; }
+  .shotbox img { display: block; width: 100%; height: auto; border-radius: 10px; border: 1px solid #27385b; }
+  .shotbox figcaption { margin-top: 6px; }
+  .q { background: #132849; border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .q i { display: block; font-size: 17px; }
+  .q span { display: block; margin-top: 4px; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #b4c3de; }
+  .fixsteps { margin: 0; padding-left: 22px; }
+  .fixsteps li { margin-bottom: 10px; font-size: 16px; line-height: 1.5; }
+  .rw { margin-top: 14px; padding-top: 14px; border-top: 1px solid #27385b; }
+  .rw div { display: grid; grid-template-columns: 48px 1fr; gap: 10px; margin-bottom: 8px; align-items: baseline; }
+  .rw span { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #b4c3de; }
+  .rw s { color: #b4c3de; }
+  .rw b { color: #e4ec66; font-size: 18px; }
   #result { white-space: pre-wrap; }
   #result b { display: block; margin-top: 10px; color: #b4c3de; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
   #result h3 { margin: 0; font-size: 19px; }
@@ -234,24 +258,90 @@ function adminNav(active) {
   return `<nav class="nav" aria-label="Back office">${link("leads", "/teardown/admin", "Leads")}${link("prompt", "/teardown/admin/prompt", "Auditor prompt")}</nav>`;
 }
 
-function renderRow(row, me, owners) {
-  const emails = parseList(row.site_emails);
-  const phones = parseList(row.site_phones);
-  const socials = parseList(row.social_links);
+const SCRIPT = `
+(function () {
+  var toast = document.getElementById("toast"), timer;
+  function say(msg, bad) {
+    toast.textContent = msg; toast.className = bad ? "bad" : ""; toast.hidden = false;
+    clearTimeout(timer); timer = setTimeout(function () { toast.hidden = true; }, bad ? 5000 : 1600);
+  }
+  function send(path, body) {
+    return fetch("/teardown/admin/api/" + path, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body)
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok || !data.ok) throw new Error(data.error || "That didn't work.");
+        return data;
+      });
+    });
+  }
+  function picked() {
+    return Array.prototype.map.call(document.querySelectorAll(".pick:checked"), function (c) { return c.value; });
+  }
+  function updateBulk() {
+    var button = document.getElementById("bulkdelete");
+    if (!button) return;
+    var n = picked().length;
+    button.hidden = n === 0;
+    button.textContent = "Delete " + n + " selected";
+  }
+  document.addEventListener("change", function (e) {
+    if (e.target.id === "checkall") {
+      document.querySelectorAll(".pick").forEach(function (c) { c.checked = e.target.checked; });
+    }
+    if (e.target.id === "checkall" || e.target.classList.contains("pick")) { updateBulk(); return; }
+    var field = e.target.getAttribute("data-field"), row = e.target.closest("[data-id]");
+    if (field && row) {
+      var body = { id: row.getAttribute("data-id") }; body[field] = e.target.value;
+      send("lead", body).then(function () { say("Saved"); }).catch(function (err) { say(err.message, true); });
+      return;
+    }
+    if (e.target.id === "paused" || e.target.id === "dailyLimit") {
+      var change = e.target.id === "paused" ? { paused: e.target.checked } : { dailyLimit: Number(e.target.value) };
+      send("settings", change).then(function () { say("Saved"); setTimeout(function () { location.reload(); }, 500); })
+        .catch(function (err) { say(err.message, true); });
+    }
+  });
+  document.addEventListener("click", function (e) {
+    if (e.target.id === "bulkdelete") {
+      var ids = picked();
+      if (!ids.length || !confirm("Delete " + ids.length + " for good? This can't be undone.")) return;
+      send("delete-many", { ids: ids }).then(function () { location.reload(); }).catch(function (err) { say(err.message, true); });
+      return;
+    }
+    if (e.target.id === "testrun") {
+      var button = e.target, status = document.getElementById("teststatus"), url = document.getElementById("testurl").value.trim();
+      if (!url) { say("Give it a website to test.", true); return; }
+      var was = status.textContent;
+      button.disabled = true; status.textContent = "Auditing. About 30 seconds.";
+      send("test-run", { url: url }).then(function (d) { location.href = "/teardown/admin/lead/" + d.id; })
+        .catch(function (err) { button.disabled = false; status.textContent = was; say(err.message, true); });
+      return;
+    }
+    var action = e.target.getAttribute("data-action"), row = e.target.closest("[data-id]");
+    if (!action || !row) return;
+    var id = row.getAttribute("data-id");
+    if (action === "delete") {
+      if (!confirm("Delete the " + row.getAttribute("data-domain") + " teardown for good? This can't be undone.")) return;
+      send("delete", { id: id }).then(function () {
+        if (document.body.getAttribute("data-page") === "lead") { location.href = "/teardown/admin"; return; }
+        row.remove(); say("Deleted"); updateBulk();
+      }).catch(function (err) { say(err.message, true); });
+    }
+    if (action === "email") {
+      // Opening your mail app counts as reaching out: move a new lead to Contacted.
+      var stage = row.querySelector('[data-field="stage"]');
+      if (stage && stage.value === "new") {
+        stage.value = "contacted";
+        send("lead", { id: id, stage: "contacted" }).then(function () { say("Marked as contacted"); }).catch(function (err) { say(err.message, true); });
+      }
+    }
+  });
+})();
+`;
+
+function workControls(row, me, owners) {
   const mailto = outreachMailto(row, me);
-
-  const contact = [
-    row.visitor_email ? `<div><span class="tag">Gave us</span> ${esc(row.visitor_email)}</div>` : "",
-    emails.length ? `<div>${emails.map(esc).join("<br>")}</div>` : "",
-    phones.length ? `<div>${phones.map((p) => `<a href="tel:${esc(p)}">${esc(p)}</a>`).join("<br>")}</div>` : "",
-    row.contact_page ? `<div>${safeLink(row.contact_page, "Contact page")}</div>` : "",
-    socials.length ? `<div>${socials.map((s) => safeLink(s, hostLabel(s))).join(" · ")}</div>` : "",
-  ].join("");
-
-  const note = row.note_problem
-    ? `<details><summary>${esc(row.note_problem)}</summary><p><b>Why:</b> ${esc(row.note_why)}</p><p><b>Fix:</b> ${esc(row.note_fix)}</p></details>`
-    : `<span class="muted">No note. Their site failed: ${esc(String(row.status).replace(/_/g, " "))}</span>`;
-
   const ownerList = [...new Set([...owners, ...(row.owner ? [row.owner] : [])])];
   const stageSelect = `<select data-field="stage" aria-label="Stage for ${esc(row.domain)}">${STAGES.map(
     (s) => `<option value="${s}"${s === (row.stage || "new") ? " selected" : ""}>${STAGE_LABELS[s]}</option>`,
@@ -262,28 +352,120 @@ function renderRow(row, me, owners) {
   const touched = row.updated_at
     ? `<div class="muted">Changed by ${esc(cap(row.updated_by))}, ${esc(String(row.updated_at).slice(0, 10))}</div>`
     : "";
-
-  return `<tr data-id="${esc(row.id)}" data-domain="${esc(row.domain)}">
-    <td class="nowrap">${esc(String(row.created_at).replace("T", " ").slice(0, 16))}${row.from_cache ? '<div class="muted">repeat site</div>' : ""}</td>
-    <td>${safeLink(row.final_url || row.input_url, row.domain)}${row.site_title ? `<div class="muted">${esc(clip(row.site_title, 70))}</div>` : ""}${row.country ? `<div class="muted">Visitor in ${esc(row.country)}</div>` : ""}</td>
-    <td class="wide">${note}</td>
-    <td>${contact || '<span class="muted">None found</span>'}</td>
-    <td class="work">
-      ${stageSelect}
+  return `${stageSelect}
       ${ownerSelect}
       <textarea data-field="notes" rows="2" maxlength="4000" placeholder="Notes" aria-label="Notes for ${esc(row.domain)}">${esc(row.admin_notes)}</textarea>
       <div class="actions">
         ${mailto ? `<a class="btn small" data-action="email" href="${esc(mailto)}">Email them</a>` : ""}
         <button class="link danger" type="button" data-action="delete">Delete</button>
       </div>
-      ${touched}
+      ${touched}`;
+}
+
+function contactBlock(row) {
+  const emails = parseList(row.site_emails);
+  const phones = parseList(row.site_phones);
+  const socials = parseList(row.social_links);
+  return [
+    row.visitor_email ? `<div><span class="tag">Gave us</span> ${esc(row.visitor_email)}</div>` : "",
+    emails.length ? `<div>${emails.map(esc).join("<br>")}</div>` : "",
+    phones.length ? `<div>${phones.map((p) => `<a href="tel:${esc(p)}">${esc(p)}</a>`).join("<br>")}</div>` : "",
+    row.contact_page ? `<div>${safeLink(row.contact_page, "Contact page")}</div>` : "",
+    socials.length ? `<div>${socials.map((s) => safeLink(s, hostLabel(s))).join(" · ")}</div>` : "",
+  ].join("") || '<span class="muted">None found</span>';
+}
+
+const validShot = (id) => /^[0-9a-f-]{36}$/.test(String(id || ""));
+
+function renderRow(row, me, owners) {
+  const detail = `/teardown/admin/lead/${esc(row.id)}`;
+  const note = row.note_problem
+    ? `<a class="headline" href="${detail}">${esc(row.note_problem)}</a><div><a href="${detail}">View the full teardown</a></div>`
+    : `<span class="muted">No note. Their site failed: ${esc(String(row.status).replace(/_/g, " "))}</span>`;
+  const thumb = validShot(row.shot_id)
+    ? `<a href="${detail}"><img class="thumb" src="/teardown/shot/${esc(row.shot_id)}" alt="" loading="lazy" width="120" height="75"></a>`
+    : "";
+
+  return `<tr data-id="${esc(row.id)}" data-domain="${esc(row.domain)}">
+    <td><input type="checkbox" class="pick" value="${esc(row.id)}" aria-label="Select ${esc(row.domain)}"></td>
+    <td class="nowrap">${esc(String(row.created_at).replace("T", " ").slice(0, 16))}${row.from_cache ? '<div class="muted">repeat site</div>' : ""}</td>
+    <td>${safeLink(row.final_url || row.input_url, row.domain)}${row.site_title ? `<div class="muted">${esc(clip(row.site_title, 70))}</div>` : ""}${row.country ? `<div class="muted">Visitor in ${esc(row.country)}</div>` : ""}${thumb}</td>
+    <td class="wide">${note}</td>
+    <td>${contactBlock(row)}</td>
+    <td class="work">
+      ${workControls(row, me, owners)}
     </td>
   </tr>`;
 }
 
+function structuredNote(row) {
+  let extra = {};
+  try {
+    extra = JSON.parse(row.note_json || "{}") || {};
+  } catch {
+    extra = {};
+  }
+  const split = (text) => String(text || "").split(/\n{2,}/).map((t) => t.trim()).filter(Boolean);
+  const list = (value, fallback) => (Array.isArray(value) && value.length ? value.map(String) : split(fallback));
+  return {
+    whyPoints: list(extra.whyPoints, row.note_why),
+    fixSteps: list(extra.fixSteps, row.note_fix),
+    evidence: Array.isArray(extra.evidence) ? extra.evidence.filter((e) => e && e.quote) : [],
+    rewrite: extra.rewrite && extra.rewrite.after ? extra.rewrite : null,
+  };
+}
+
+function renderLeadPage({ row, me, owners }) {
+  const note = structuredNote(row);
+  const when = String(row.created_at).replace("T", " ").slice(0, 16);
+  const facts = [
+    row.is_test ? "Test run from the back office" : null,
+    row.country ? `Visitor in ${esc(row.country)}` : null,
+    row.from_cache ? "Repeat site, shown the saved note" : null,
+    row.prompt_version ? `Auditor prompt version ${esc(row.prompt_version)}` : "Built-in auditor prompt",
+    row.status !== "ok" && row.status !== "test" ? `Result: ${esc(String(row.status).replace(/_/g, " "))}` : null,
+  ].filter(Boolean);
+
+  const body = row.note_problem
+    ? `${validShot(row.shot_id) ? `<figure class="shotbox"><img src="/teardown/shot/${esc(row.shot_id)}" alt="The top of ${esc(row.domain)} when it was audited" width="1280" height="800"><figcaption class="muted">What a stranger sees first</figcaption></figure>` : '<p class="muted">No screenshot was taken for this one.</p>'}
+      <p class="big">${esc(row.note_problem)}</p>
+      ${note.evidence.length ? `<h2>On their site</h2>${note.evidence.map((e) => `<div class="q"><i>\u201c${esc(e.quote)}\u201d</i>${e.where ? `<span>${esc(e.where)}</span>` : ""}</div>`).join("")}` : ""}
+      <h2>Why it's costing them</h2>
+      ${note.whyPoints.map((p) => `<p>${esc(p)}</p>`).join("")}
+      <h2>The fix</h2>
+      <ol class="fixsteps">${note.fixSteps.map((p) => `<li>${esc(p)}</li>`).join("")}</ol>
+      ${note.rewrite ? `<div class="rw">${note.rewrite.before ? `<div><span>Now</span><s>${esc(note.rewrite.before)}</s></div>` : ""}<div><span>Try</span><b>${esc(note.rewrite.after)}</b></div></div>` : ""}`
+    : `<p class="muted">No note. Their site failed: ${esc(String(row.status).replace(/_/g, " "))}.</p>`;
+
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>${esc(row.domain)} teardown</title>
+<style>${CSS}</style></head><body data-page="lead"><main>
+
+<div class="top">
+  <div><a href="/teardown/admin${row.is_test ? "?tests=1" : ""}">\u2190 All ${row.is_test ? "tests" : "leads"}</a>
+    <h1>${esc(row.domain)}</h1>
+    <div class="muted">${esc(when)} UTC. ${safeLink(row.final_url || row.input_url, "Open their site")}${row.site_title ? `. ${esc(clip(row.site_title, 90))}` : ""}</div></div>
+</div>
+
+<div class="cols">
+  <div class="card lead">${body}</div>
+  <div data-id="${esc(row.id)}" data-domain="${esc(row.domain)}">
+    <div class="card work" style="width:auto"><h2>Working it</h2>${workControls(row, me, owners)}</div>
+    <div class="card"><h2>Contact</h2>${contactBlock(row)}</div>
+    <div class="card"><h2>Details</h2>${facts.map((f) => `<div class="muted">${f}</div>`).join("")}</div>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite" hidden></div>
+</main>
+<script>${SCRIPT}</script>
+</body></html>`;
+}
+
 function renderPage({ rows, stats, settings, filters, me, owners, hasCache }) {
   const tab = (stage, label, count) =>
-    `<a class="tab${(filters.stage || "") === stage ? " on" : ""}" href="/teardown/admin${queryString(filters, { stage })}">${esc(label)} <span>${count}</span></a>`;
+    `<a class="tab${!filters.tests && (filters.stage || "") === stage ? " on" : ""}" href="/teardown/admin${queryString({ ...filters, tests: false }, { stage })}">${esc(label)} <span>${count}</span></a>`;
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
@@ -316,76 +498,38 @@ ${adminNav("leads")}
   <span class="muted">${settings.paused ? "Paused. Visitors see a “check back soon” message and nothing is spent on audits." : "Live."}${hasCache ? "" : " The daily limit needs the cache turned on (see README)."}${settings.upcoming ? ` The daily limit changes to ${settings.upcoming.dailyLimit} on ${esc(new Date(settings.upcoming.from).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "America/New_York" }))}. Changing the number here cancels that.` : ""}</span>
 </div>
 
+<div class="panel">
+  <div><h2 style="margin:0">Run a test teardown</h2></div>
+  <input type="text" id="testurl" inputmode="url" autocapitalize="none" spellcheck="false" placeholder="yourbrand.com" aria-label="Website to test" style="flex:1 1 220px;width:auto;max-width:360px">
+  <button class="btn small" type="button" id="testrun">Run test</button>
+  <span class="muted" id="teststatus">Skips the daily limit and stays out of your numbers. Costs one audit. Filed under Tests.</span>
+</div>
+
 <nav class="tabs" aria-label="Filter by stage">
   ${tab("", "All", stats.total)}
   ${STAGES.map((s) => tab(s, STAGE_LABELS[s], stats.stages[s])).join("")}
+  <a class="tab${filters.tests ? " on" : ""}" href="/teardown/admin?tests=1">Tests <span>${stats.tests}</span></a>
 </nav>
 
 <form class="tools" method="get" action="/teardown/admin">
   ${filters.stage ? `<input type="hidden" name="stage" value="${esc(filters.stage)}">` : ""}
+  ${filters.tests ? '<input type="hidden" name="tests" value="1">' : ""}
   <input type="search" name="q" value="${esc(filters.q)}" placeholder="Search site, email, note" aria-label="Search leads">
   <label style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="reachable" value="1"${filters.reachable ? " checked" : ""}> Only leads we can reach</label>
   <button class="btn small" type="submit">Filter</button>
   ${filters.q || filters.reachable ? `<a href="/teardown/admin${queryString({ stage: filters.stage })}">Clear</a>` : ""}
   <span class="muted">${rows.length} shown</span>
+  <button class="btn small ghost" id="bulkdelete" type="button" hidden></button>
 </form>
 
 <div class="wrap"><table>
-<thead><tr><th>When</th><th>Website</th><th>What we told them</th><th>Contact</th><th>Working it</th></tr></thead>
-<tbody>${rows.map((r) => renderRow(r, me, owners)).join("") || '<tr><td colspan="5" class="muted">Nothing here yet.</td></tr>'}</tbody>
+<thead><tr><th><input type="checkbox" id="checkall" aria-label="Select all shown"></th><th>When</th><th>Website</th><th>What we told them</th><th>Contact</th><th>Working it</th></tr></thead>
+<tbody>${rows.map((r) => renderRow(r, me, owners)).join("") || '<tr><td colspan="6" class="muted">Nothing here yet.</td></tr>'}</tbody>
 </table></div>
 
 <div id="toast" role="status" aria-live="polite" hidden></div>
 </main>
-<script>
-(function () {
-  var toast = document.getElementById("toast"), timer;
-  function say(msg, bad) {
-    toast.textContent = msg; toast.className = bad ? "bad" : ""; toast.hidden = false;
-    clearTimeout(timer); timer = setTimeout(function () { toast.hidden = true; }, bad ? 5000 : 1600);
-  }
-  function send(path, body) {
-    return fetch("/teardown/admin/api/" + path, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body)
-    }).then(function (res) {
-      return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok || !data.ok) throw new Error(data.error || "That didn't save.");
-        return data;
-      });
-    });
-  }
-  document.addEventListener("change", function (e) {
-    var field = e.target.getAttribute("data-field"), row = e.target.closest("tr[data-id]");
-    if (field && row) {
-      var body = { id: row.getAttribute("data-id") }; body[field] = e.target.value;
-      send("lead", body).then(function () { say("Saved"); }).catch(function (err) { say(err.message, true); });
-      return;
-    }
-    if (e.target.id === "paused" || e.target.id === "dailyLimit") {
-      var change = e.target.id === "paused" ? { paused: e.target.checked } : { dailyLimit: Number(e.target.value) };
-      send("settings", change).then(function () { say("Saved"); setTimeout(function () { location.reload(); }, 500); })
-        .catch(function (err) { say(err.message, true); });
-    }
-  });
-  document.addEventListener("click", function (e) {
-    var action = e.target.getAttribute("data-action"), row = e.target.closest("tr[data-id]");
-    if (!action || !row) return;
-    var id = row.getAttribute("data-id");
-    if (action === "delete") {
-      if (!confirm("Delete the " + row.getAttribute("data-domain") + " lead for good? This can't be undone.")) return;
-      send("delete", { id: id }).then(function () { row.remove(); say("Deleted"); }).catch(function (err) { say(err.message, true); });
-    }
-    if (action === "email") {
-      // Opening your mail app counts as reaching out: move a new lead to Contacted.
-      var stage = row.querySelector('[data-field="stage"]');
-      if (stage && stage.value === "new") {
-        stage.value = "contacted";
-        send("lead", { id: id, stage: "contacted" }).then(function () { say("Marked as contacted"); }).catch(function (err) { say(err.message, true); });
-      }
-    }
-  });
-})();
-</script>
+<script>${SCRIPT}</script>
 </body></html>`;
 }
 
@@ -515,6 +659,31 @@ async function tryPrompt(env, body) {
   }
 }
 
+// A full teardown run by Ned or Brian: same steps as a visitor's, no daily limit, filed under Tests.
+async function testRun(env, body) {
+  if (!env.ANTHROPIC_API_KEY) return json({ ok: false, error: "The Claude API key isn't set yet." }, 503);
+  try {
+    const fetched = await safeFetchPage(normalizeUrl(body?.url));
+    const page = extractPage(fetched.html, fetched.finalUrl);
+    if (hasTooLittleContent(page)) return json({ ok: false, error: "That site has almost no text to audit. Try another." }, 422);
+    const active = await getActivePrompt(env.DB);
+    const shot = await takeScreenshot(env, fetched.finalUrl);
+    const note = await runFreeAudit(page, env, fetch, active.prompt, shot);
+    const id = crypto.randomUUID();
+    const savedShot = await saveScreenshot(env, id, shot).catch(() => false);
+    await insertLead(env.DB, {
+      id, createdAt: new Date().toISOString(), inputUrl: fetched.finalUrl, finalUrl: fetched.finalUrl,
+      domain: new URL(fetched.finalUrl).hostname.toLowerCase().replace(/^www\./, ""),
+      status: "ok", note, contacts: extractContacts(fetched.html, fetched.finalUrl), socialLinks: page.socialLinks,
+      siteTitle: page.title, promptVersion: active.version, shotId: savedShot ? id : null, isTest: true,
+    });
+    return json({ ok: true, id });
+  } catch (err) {
+    if (err instanceof TeardownError) return json({ ok: false, error: err.message }, err.status);
+    throw err;
+  }
+}
+
 // ---------- routes ----------
 
 async function handleAction(request, env, pathname, me) {
@@ -550,6 +719,11 @@ async function handleAction(request, env, pathname, me) {
       const found = await deleteLead(env.DB, id);
       return found ? json({ ok: true }) : json({ ok: false, error: "That lead no longer exists." }, 404);
     }
+    if (pathname === "/teardown/admin/api/delete-many") {
+      if (!Array.isArray(body?.ids)) return json({ ok: false, error: "Bad request." }, 400);
+      return json({ ok: true, deleted: await deleteLeads(env.DB, body.ids) });
+    }
+    if (pathname === "/teardown/admin/api/test-run") return await testRun(env, body);
     if (pathname === "/teardown/admin/api/prompt") {
       if (typeof body?.prompt !== "string") return json({ ok: false, error: "Bad request." }, 400);
       const saved = await savePrompt(env.DB, body.prompt, me);
@@ -587,7 +761,9 @@ export async function handleAdmin(request, env, pathname) {
     stage: STAGES.includes(params.get("stage")) ? params.get("stage") : "",
     q: (params.get("q") || "").trim().slice(0, 100),
     reachable: params.get("reachable") === "1",
+    tests: params.get("tests") === "1",
   };
+  if (filters.tests) filters.stage = "";
 
   if (pathname === "/teardown/admin/leads.csv") {
     const rows = await listLeads(env.DB, { ...filters, limit: 5000 });
@@ -607,6 +783,12 @@ export async function handleAdmin(request, env, pathname) {
     ]);
     const page = renderPage({ rows, stats, settings, filters, me, owners: ownerChoices(env), hasCache: Boolean(env.TEARDOWN_KV) });
     return new Response(page, { headers: { "content-type": "text/html; charset=utf-8", ...PRIVATE_HEADERS } });
+  }
+  if (pathname.startsWith("/teardown/admin/lead/")) {
+    const id = pathname.slice("/teardown/admin/lead/".length);
+    const row = /^[0-9a-f-]{36}$/.test(id) ? await getLead(env.DB, id) : null;
+    if (!row) return text("That teardown doesn't exist any more.", 404);
+    return new Response(renderLeadPage({ row, me, owners: ownerChoices(env) }), { headers: { "content-type": "text/html; charset=utf-8", ...PRIVATE_HEADERS } });
   }
   if (pathname === "/teardown/admin/prompt") {
     const [active, versions] = await Promise.all([getActivePrompt(env.DB), listPromptVersions(env.DB)]);

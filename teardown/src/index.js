@@ -124,6 +124,7 @@ async function handleAudit(request, env, ctx) {
       await recordLead(env, {
         ...lead, status: "ok", fromCache: true, finalUrl: hit.result.url, domain: hit.result.domain,
         note: hit.result.note, contacts: hit.contacts, socialLinks: hit.socialLinks, siteTitle: hit.siteTitle,
+        shotId: hit.result.shot ? String(hit.result.shot).split("/").pop() : null,
       });
       return json({ ok: true, cached: true, leadId: lead.id, ...hit.result });
     }
@@ -171,6 +172,7 @@ async function handleAudit(request, env, ctx) {
   await recordLead(env, {
     ...lead, status: "ok", fromCache: false, finalUrl: fetched.finalUrl, domain: result.domain,
     note, contacts, socialLinks: page.socialLinks, siteTitle: page.title,
+    shotId: result.shot ? lead.id : null,
   });
 
   // After the visitor has their answer: check the contact page, then cache.

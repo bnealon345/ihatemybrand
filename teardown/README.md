@@ -38,7 +38,9 @@ What it does:
 - **Email them:** opens your own mail app with a draft built from their note, with an opt-out line. Nothing is sent by the system. Clicking it moves a New lead to Contacted.
 - **Find things:** tabs per stage, search by site, email or note, and a "only leads we can reach" filter.
 - **Download CSV:** exports whatever the current filter shows.
-- **Delete:** removes a lead for good, for when someone asks you to.
+- **Open any teardown in full:** click its headline to see the screenshot, the quotes from their site, the whole note laid out as the visitor saw it, and the contacts, with the pipeline controls beside it.
+- **Run a test teardown:** a box at the top of the Leads tab. Skips the daily limit, stays out of your numbers and the CSV, and is filed under the Tests tab.
+- **Delete:** removes a lead for good, for when someone asks you to. Tick several rows to delete them together.
 - **Teardown controls:** pause new teardowns (stops all audit spending) and set how many free teardowns one visitor gets per day.
 - **Auditor prompt** (its own tab): edit what the AI is told before it reads a site. Every save is a numbered version you can go back to, and "Try it before you save" runs a draft on a real site without saving or creating a lead. A saved change applies to the next teardown. The answer format and the never-invent rule are locked and added after your text.
 

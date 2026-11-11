@@ -22,6 +22,9 @@ const SCHEMA = [
     social_links TEXT,
     country TEXT,
     prompt_version INTEGER,
+    note_json TEXT,
+    shot_id TEXT,
+    is_test INTEGER NOT NULL DEFAULT 0,
     stage TEXT NOT NULL DEFAULT 'new',
     owner TEXT,
     admin_notes TEXT,
@@ -42,6 +45,9 @@ const LATER_COLUMNS = {
   updated_at: "TEXT",
   updated_by: "TEXT",
   prompt_version: "INTEGER",
+  note_json: "TEXT",
+  shot_id: "TEXT",
+  is_test: "INTEGER NOT NULL DEFAULT 0",
 };
 
 export const STAGES = ["new", "contacted", "replied", "won", "not_a_fit", "do_not_contact"];
@@ -71,8 +77,9 @@ export async function insertLead(db, lead) {
   await db
     .prepare(
       `INSERT INTO teardowns (id, created_at, input_url, final_url, domain, tier, status, from_cache, site_title,
-         note_problem, note_why, note_fix, site_emails, site_phones, contact_page, social_links, country, prompt_version)
-       VALUES (?, ?, ?, ?, ?, 'free', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         note_problem, note_why, note_fix, site_emails, site_phones, contact_page, social_links, country, prompt_version,
+         note_json, shot_id, is_test)
+       VALUES (?, ?, ?, ?, ?, 'free', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       lead.id,
@@ -92,6 +99,12 @@ export async function insertLead(db, lead) {
       list(lead.socialLinks),
       lead.country ?? null,
       lead.promptVersion ?? null,
+      lead.note ? JSON.stringify({
+        whyPoints: lead.note.whyPoints || [], fixSteps: lead.note.fixSteps || [],
+        evidence: lead.note.evidence || [], rewrite: lead.note.rewrite || null,
+      }) : null,
+      lead.shotId ?? null,
+      lead.isTest ? 1 : 0,
     )
     .run();
 }
@@ -114,9 +127,10 @@ export async function saveVisitorEmail(db, id, email) {
 const REACHABLE = `(visitor_email IS NOT NULL OR site_emails NOT IN ('[]', '') OR site_phones NOT IN ('[]', ''))`;
 
 /** Newest first. Filters: stage, q (search text), reachable (only leads with a way to contact them). */
-export async function listLeads(db, { stage, q, reachable, limit = 500 } = {}) {
+export async function listLeads(db, { stage, q, reachable, tests = false, limit = 500 } = {}) {
   await ensureSchema(db);
-  const where = [];
+  // Test runs from the back office are kept apart from real leads.
+  const where = [tests ? `is_test = 1` : `is_test = 0`];
   const args = [];
   if (STAGES.includes(stage)) {
     where.push(`stage = ?`);
@@ -149,17 +163,19 @@ export async function leadStats(db, now = new Date()) {
                 SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS week,
                 SUM(CASE WHEN visitor_email IS NOT NULL THEN 1 ELSE 0 END) AS gave_email,
                 SUM(CASE WHEN ${REACHABLE} THEN 1 ELSE 0 END) AS reachable
-         FROM teardowns`,
+         FROM teardowns WHERE is_test = 0`,
       )
       .bind(today, weekAgo)
       .all()
   ).results?.[0] || {};
   const stages = Object.fromEntries(STAGES.map((s) => [s, 0]));
-  for (const row of (await db.prepare(`SELECT stage, COUNT(*) AS n FROM teardowns GROUP BY stage`).all()).results || []) {
+  for (const row of (await db.prepare(`SELECT stage, COUNT(*) AS n FROM teardowns WHERE is_test = 0 GROUP BY stage`).all()).results || []) {
     if (row.stage in stages) stages[row.stage] = Number(row.n);
   }
   const num = (v) => Number(v || 0);
+  const tests = num((await db.prepare(`SELECT COUNT(*) AS n FROM teardowns WHERE is_test = 1`).all()).results?.[0]?.n);
   return {
+    tests,
     total: num(totals.total), today: num(totals.today), week: num(totals.week),
     gaveEmail: num(totals.gave_email), reachable: num(totals.reachable), stages,
   };
@@ -189,6 +205,20 @@ export async function updateLead(db, id, changes, by, now = new Date()) {
   args.push(now.toISOString(), by);
   const res = await db.prepare(`UPDATE teardowns SET ${sets.join(", ")} WHERE id = ?`).bind(...args, id).run();
   return (res?.meta?.changes ?? 0) > 0;
+}
+
+export async function getLead(db, id) {
+  await ensureSchema(db);
+  return (await db.prepare(`SELECT * FROM teardowns WHERE id = ?`).bind(id).all()).results?.[0] || null;
+}
+
+/** Deletes up to 200 leads at once. Returns how many went. */
+export async function deleteLeads(db, ids) {
+  await ensureSchema(db);
+  const list = [...new Set(ids)].filter((id) => /^[0-9a-f-]{36}$/.test(String(id))).slice(0, 200);
+  if (!list.length) return 0;
+  const res = await db.prepare(`DELETE FROM teardowns WHERE id IN (${list.map(() => "?").join(", ")})`).bind(...list).run();
+  return res?.meta?.changes ?? 0;
 }
 
 export async function deleteLead(db, id) {

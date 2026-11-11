@@ -937,3 +937,76 @@ test("a scheduled limit change takes over on its date, and a manual change cance
   await saveSettings(db, { dailyLimit: 7 });
   assert.equal((await getSettings(db, new Date("2026-12-01T00:00:00Z"))).dailyLimit, 7);
 });
+
+// ---------- back office: full view, tests, bulk delete ----------
+
+test("opens one teardown in full, with the screenshot, quotes, paragraphs and steps", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1(), TEARDOWN_KV: kvWithMeta(), BROWSER: fakeBrowser(jpeg), ADMIN_USERS: USERS };
+  const data = await withNet(acmeNet(claudeReply(RICH_NOTE)), async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+
+  const list = await (await admin(env, "/teardown/admin")).text();
+  assert.ok(list.includes(`href="/teardown/admin/lead/${data.leadId}"`));
+  assert.ok(list.includes(`src="/teardown/shot/${data.leadId}"`), "thumbnail in the list");
+  new Function(list.match(/<script>([\s\S]*?)<\/script>/)[1]);
+
+  const res = await admin(env, "/teardown/admin/lead/" + data.leadId);
+  assert.equal(res.status, 200);
+  const page = await res.text();
+  assert.ok(page.includes(`<img src="/teardown/shot/${data.leadId}"`));
+  assert.match(page, /<p class="big">Your headline says nothing\.<\/p>/);
+  assert.match(page, /“Empowering Tomorrow”<\/i><span>Hero headline<\/span>/);
+  assert.match(page, /<p>They leave before they scroll\.<\/p>/);
+  assert.match(page, /<li>Make the button say what happens next\.<\/li>/);
+  assert.match(page, /<s>Empowering Tomorrow<\/s>[\s\S]*<b>Payroll software for restaurants\.<\/b>/);
+  assert.match(page, /data-field="stage"/);
+  assert.match(page, /<body data-page="lead">/);
+
+  assert.equal((await admin(env, "/teardown/admin/lead/" + data.leadId, { pw: "wrong" })).status, 401);
+  assert.equal((await admin(env, "/teardown/admin/lead/11111111-1111-4111-8111-111111111111")).status, 404);
+  assert.equal((await admin(env, "/teardown/admin/lead/nope")).status, 404);
+});
+
+test("older leads without the structured note still open", async () => {
+  const { env, bob } = await seeded();
+  const page = await (await admin(env, "/teardown/admin/lead/" + bob.id)).text();
+  assert.match(page, /<p class="big">Nobody can tell what you sell\.<\/p>/);
+  assert.match(page, /No screenshot was taken for this one\./);
+  assert.match(page, /service@bobsauto\.com/);
+});
+
+test("a test run skips the daily limit, is filed under Tests and stays out of the numbers", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test", DB: fakeD1(), TEARDOWN_KV: kvWithMeta(), BROWSER: fakeBrowser(jpeg), ADMIN_USERS: USERS };
+  await admin(env, "/teardown/admin/api/settings", { body: { dailyLimit: 1 } });
+  const net = () => acmeNet(claudeReply(RICH_NOTE));
+
+  const ids = [];
+  for (let i = 0; i < 3; i++) {
+    const res = await withNet(net(), () => admin(env, "/teardown/admin/api/test-run", { body: { url: "acme.com" } }));
+    const data = await res.json();
+    assert.equal(data.ok, true, "no limit on test runs");
+    ids.push(data.id);
+  }
+  assert.equal((await withNet(net(), () => admin(env, "/teardown/admin/api/test-run", { body: { url: "acme.com" }, origin: "https://evil.example" }))).status, 403);
+  assert.equal((await withNet(fakeNet({ dns: {}, pages: {} }), () => admin(env, "/teardown/admin/api/test-run", { body: { url: "http://10.0.0.1" } }))).status, 400);
+
+  const main = await (await admin(env, "/teardown/admin")).text();
+  assert.match(main, /<b>0<\/b>all time/);
+  assert.match(main, /Tests <span>3<\/span>/);
+  assert.doesNotMatch(main, /data-domain="acme\.com"/);
+  const tests = await (await admin(env, "/teardown/admin?tests=1")).text();
+  assert.equal(tests.match(/data-domain="acme\.com"/g).length, 3);
+  assert.equal((await (await admin(env, "/teardown/admin/leads.csv")).text()).trim().split("\r\n").length, 1, "tests are not exported with leads");
+
+  const detail = await (await admin(env, "/teardown/admin/lead/" + ids[0])).text();
+  assert.match(detail, /Test run from the back office/);
+  assert.match(detail, /All tests/);
+});
+
+test("deletes several teardowns at once", async () => {
+  const { env, bob, acme } = await seeded();
+  let res = await admin(env, "/teardown/admin/api/delete-many", { body: { ids: [bob.id, acme.id, "junk", "11111111-1111-4111-8111-111111111111"] } });
+  assert.deepEqual(await res.json(), { ok: true, deleted: 2 });
+  assert.equal(env.DB.rows().length, 0);
+  res = await admin(env, "/teardown/admin/api/delete-many", { body: { ids: "all" } });
+  assert.equal(res.status, 400);
+});
