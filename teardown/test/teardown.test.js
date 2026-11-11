@@ -228,7 +228,10 @@ test("end to end: URL in, free note out, then served from cache", async () => {
   assert.equal(first.ok, true);
   assert.equal(first.cached, false);
   assert.equal(first.domain, "acme.com");
-  assert.deepEqual(first.note, { problem: GOOD_NOTE.problem, why: GOOD_NOTE.why_its_costing_them, fix: GOOD_NOTE.fix });
+  assert.equal(first.note.problem, GOOD_NOTE.problem);
+  assert.equal(first.note.why, GOOD_NOTE.why_its_costing_them);
+  assert.equal(first.note.fix, GOOD_NOTE.fix);
+  assert.equal(first.shot, undefined, "no browser binding, so no screenshot");
 
   const sent = claudeReply.last;
   assert.equal(sent.headers["x-api-key"], "sk-test");
@@ -821,4 +824,96 @@ test("retries once when the answer is incomplete, then gives up without inventin
   res = await withNet(acmeNet(never), () => worker.fetch(post({ url: "acme.com" }), env, {}));
   assert.equal(res.status, 502);
   assert.equal(calls, 2, "two tries at most");
+});
+
+// ---------- screenshots and the structured note ----------
+
+const RICH_NOTE = {
+  can_audit: true,
+  problem: "Your headline says nothing.",
+  evidence: [
+    { quote: "Empowering Tomorrow", where: "Hero headline" },
+    { quote: "\u201cLearn More\u201d", where: "Main button" },
+    { quote: "We are the best in the world", where: "Made up by the model" },
+  ],
+  why_its_costing_them: ["A stranger can't tell what you sell.", "They leave before they scroll.", "Your button doesn't help."],
+  fix: ["Say what you sell in the headline.", "Make the button say what happens next."],
+  rewrite: { before: "Empowering Tomorrow", after: "Payroll software for restaurants." },
+};
+
+function fakeBrowser(response) {
+  const calls = [];
+  return { calls, quickAction: async (action, opts) => { calls.push({ action, opts }); return response(); } };
+}
+const jpeg = () => new Response(new Uint8Array(4000).fill(7), { headers: { "content-type": "image/jpeg" } });
+function kvWithMeta() {
+  const kv = fakeKV();
+  const meta = new Map();
+  const put = kv.put;
+  kv.put = async (key, value, opts) => { if (opts?.metadata) meta.set(key, opts.metadata); return put(key, value); };
+  kv.getWithMetadata = async (key) => ({ value: kv.store.get(key) ?? null, metadata: meta.get(key) ?? null });
+  return kv;
+}
+
+test("takes a screenshot, shows it to the auditor, and serves it back with the note", async () => {
+  const browser = fakeBrowser(jpeg);
+  const env = { ANTHROPIC_API_KEY: "sk-test", TEARDOWN_KV: kvWithMeta(), BROWSER: browser };
+  const data = await withNet(acmeNet(claudeReply(RICH_NOTE)), async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+
+  assert.equal(browser.calls[0].action, "screenshot");
+  assert.equal(browser.calls[0].opts.url, "https://acme.com/");
+  assert.deepEqual(browser.calls[0].opts.viewport, { width: 1280, height: 800 });
+
+  const sent = claudeReply.last.body.messages[0].content;
+  assert.equal(sent[0].type, "image");
+  assert.equal(sent[0].source.media_type, "image/jpeg");
+  assert.equal(atob(sent[0].source.data).length, 4000);
+  assert.match(sent[1].text, /A screenshot of the top of their page is attached/);
+
+  assert.match(data.shot, /^\/teardown\/shot\/[0-9a-f-]{36}$/);
+  assert.equal(data.shot, "/teardown/shot/" + data.leadId);
+  const img = await worker.fetch(new Request("https://ihatemybrand.com" + data.shot), env, {});
+  assert.equal(img.status, 200);
+  assert.equal(img.headers.get("content-type"), "image/jpeg");
+  assert.equal((await img.arrayBuffer()).byteLength, 4000);
+
+  const none = await worker.fetch(new Request("https://ihatemybrand.com/teardown/shot/00000000-0000-4000-8000-000000000000"), env, {});
+  assert.equal(none.status, 404);
+  const bad = await worker.fetch(new Request("https://ihatemybrand.com/teardown/shot/..%2Fnote"), env, {});
+  assert.equal(bad.status, 404);
+});
+
+test("breaks the note into paragraphs and steps, and only quotes words that are really on the page", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test" };
+  const { note } = await withNet(acmeNet(claudeReply(RICH_NOTE)), async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+
+  assert.deepEqual(note.whyPoints, RICH_NOTE.why_its_costing_them);
+  assert.deepEqual(note.fixSteps, RICH_NOTE.fix);
+  assert.equal(note.why, RICH_NOTE.why_its_costing_them.join("\n\n"));
+  assert.equal(note.fix, RICH_NOTE.fix.join("\n\n"));
+  assert.deepEqual(note.evidence, [
+    { quote: "Empowering Tomorrow", where: "Hero headline" },
+    { quote: "Learn More", where: "Main button" },
+  ], "the invented quote is dropped");
+  assert.deepEqual(note.rewrite, { before: "Empowering Tomorrow", after: "Payroll software for restaurants." });
+
+  const invented = { ...RICH_NOTE, rewrite: { before: "A line that is not on the site", after: "Better line." } };
+  const second = await withNet(acmeNet(claudeReply(invented)), async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+  assert.deepEqual(second.note.rewrite, { before: "", after: "Better line." });
+});
+
+test("a failed or oversized screenshot never blocks the teardown", async () => {
+  for (const response of [
+    () => new Response("limit", { status: 429 }),
+    () => { throw new Error("browser exploded"); },
+    () => new Response("<html>", { headers: { "content-type": "text/html" } }),
+    () => new Response(new Uint8Array(2_000_000), { headers: { "content-type": "image/jpeg" } }),
+  ]) {
+    const env = { ANTHROPIC_API_KEY: "sk-test", TEARDOWN_KV: kvWithMeta(), BROWSER: fakeBrowser(response) };
+    const data = await withNet(acmeNet(claudeReply(GOOD_NOTE)), async () => (await worker.fetch(post({ url: "acme.com" }), env, {})).json());
+    assert.equal(data.ok, true);
+    assert.equal(data.shot, undefined);
+    assert.equal(typeof claudeReply.last.body.messages[0].content, "string", "text only");
+    assert.match(claudeReply.last.body.messages[0].content, /There is no screenshot/);
+  }
 });

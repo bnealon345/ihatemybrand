@@ -17,6 +17,9 @@
   // The main site's Worker. home.js asks it for the homepage, then adds the teardown band, nav link and thumbs logo.
   "services": [{ "binding": "SITE", "service": "ihatemybrand" }],
 
+  // Headless browser for the screenshot shown with each teardown. Free plan: 10 minutes of browser time a day.
+  "browser": { "binding": "BROWSER" },
+
   // Leads, settings and auditor prompt versions. Created in the Cloudflare account on 2026-11-10.
   "d1_databases": [
     { "binding": "DB", "database_name": "ihmb-teardown", "database_id": "90499b23-3f25-4ad9-b5d9-8e38511ccc5e" }

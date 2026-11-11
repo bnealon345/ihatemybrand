@@ -3,6 +3,7 @@
 // Routes
 //   POST /teardown/api/audit   { "url": "yourbrand.com" }        ->  { ok, leadId, domain, note }
 //   POST /teardown/api/email   { "leadId": "...", "email": "" }  ->  { ok }
+//   GET  /teardown/shot/<id>   the screenshot taken for a teardown
 //   GET  /teardown/admin       private leads table (and /teardown/admin/leads.csv)
 //   GET  /                     the main site's homepage with the teardown band added (see home.js)
 //   everything else            static files from ./public
@@ -13,10 +14,11 @@ import { runFreeAudit } from "./audit.js";
 import { insertLead, updateContacts, saveVisitorEmail, getSettings, getActivePrompt, DEFAULT_SETTINGS } from "./leads.js";
 import { handleAdmin } from "./admin.js";
 import { serveHome } from "./home.js";
+import { takeScreenshot, saveScreenshot, serveScreenshot } from "./shot.js";
 
 const CACHE_TTL_SECONDS = 24 * 60 * 60;
 const EMAIL_SAVES_PER_IP_PER_DAY = 20;
-const CACHE_VERSION = "v2";
+const CACHE_VERSION = "v3";
 
 // Failures worth keeping as leads: someone wanted an audit and their site let them down.
 const LOGGED_FAILURES = new Set([
@@ -135,7 +137,7 @@ async function handleAudit(request, env, ctx) {
   }
   await checkRateLimit(env, "ip", ip, settings.dailyLimit, "That's enough free teardowns for one day. Come back tomorrow.");
 
-  let fetched, page, contacts, note;
+  let fetched, page, contacts, note, shot;
   try {
     fetched = await safeFetchPage(url);
     page = extractPage(fetched.html, fetched.finalUrl);
@@ -146,7 +148,9 @@ async function handleAudit(request, env, ctx) {
         "We loaded your site but found almost no text on it. It may be built so that content only shows up in a browser, or it may just be empty. Either way we won't make up an audit.",
       );
     }
-    note = await runFreeAudit(page, env, fetch, auditor.prompt);
+    // What a stranger sees first. Optional: the audit runs on text alone if this fails.
+    shot = await takeScreenshot(env, fetched.finalUrl);
+    note = await runFreeAudit(page, env, fetch, auditor.prompt, shot);
   } catch (err) {
     if (err instanceof TeardownError && LOGGED_FAILURES.has(err.code)) {
       await recordLead(env, {
@@ -158,6 +162,11 @@ async function handleAudit(request, env, ctx) {
 
   // Only this goes back to the visitor. Contact details stay on our side.
   const result = { domain: domainOf(fetched.finalUrl), url: fetched.finalUrl, note, auditedAt: lead.createdAt };
+  try {
+    if (await saveScreenshot(env, lead.id, shot)) result.shot = `/teardown/shot/${lead.id}`;
+  } catch (err) {
+    console.error("Could not save screenshot", err?.message || err);
+  }
 
   await recordLead(env, {
     ...lead, status: "ok", fromCache: false, finalUrl: fetched.finalUrl, domain: result.domain,
@@ -211,6 +220,10 @@ export default {
       } catch (err) {
         return fail(err);
       }
+    }
+
+    if (pathname.startsWith("/teardown/shot/") && request.method === "GET") {
+      return serveScreenshot(env, pathname.slice("/teardown/shot/".length));
     }
 
     if (pathname === "/teardown/admin" || pathname.startsWith("/teardown/admin/")) {

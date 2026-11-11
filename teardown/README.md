@@ -4,7 +4,7 @@ A visitor drops their website and gets one brutally honest note on the biggest p
 
 **Built:** URL in, free note out. Lead storage, contact details pulled from the site, optional visitor email, and a back office for working the leads.
 
-**Not built yet:** the shareable report card, Stripe and the full teardown, screenshots, automated outreach.
+**Not built yet:** the shareable report card, Stripe and the full teardown, automated outreach.
 
 ## Run it
 
@@ -65,6 +65,8 @@ For an automated outreach system, read the same table (`teardowns` in the D1 dat
 | `src/safe-fetch.js` | Fetches the visitor's site. Blocks private addresses, caps time and size. |
 | `src/extract.js` | Pulls page content for the auditor, and contact details for the lead. |
 | `src/audit.js` | The auditor prompt and the Claude API call. |
+| `src/shot.js` | The screenshot shown with each teardown. |
+| `src/home.js` | Adds the teardown band, nav link and thumbs logo to the main site's homepage. |
 | `src/leads.js` | The leads table and CSV. |
 | `src/admin.js` | The back office: sign-in, dashboard, lead actions, settings. |
 | `test/` | `npm test`. No network or key needed. |
@@ -78,7 +80,8 @@ For an automated outreach system, read the same table (`teardowns` in the D1 dat
 
 ## Known limits
 
-- No screenshot, so the auditor is told not to comment on visual design.
+- The screenshot is the top of the page only, at desktop width. The free Cloudflare plan allows about 10 minutes of browser time a day and one screenshot every 10 seconds. Past that, teardowns still run, without a screenshot.
+- A quote is only shown if those exact words are on the visitor's page, so some notes show fewer quotes than the auditor wrote.
 - Sites that only show content after JavaScript runs come back as "too little content".
 - Contact details are only what the site publishes in plain view. Sites that hide them behind forms will show none.
 - The rate limit is per IP only.
