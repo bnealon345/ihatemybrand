@@ -802,3 +802,23 @@ test("accepts a JSON answer when the model replies in text instead of calling th
   res = await withNet(acmeNet(asText("Your headline is weak. Fix it.")), () => worker.fetch(post({ url: "acme.com" }), env, {}));
   assert.equal(res.status, 502, "free text with no structure is not shown as an audit");
 });
+
+test("retries once when the answer is incomplete, then gives up without inventing anything", async () => {
+  const env = { ANTHROPIC_API_KEY: "sk-test" };
+  let calls = 0;
+  const flaky = (init) => {
+    calls++;
+    const input = calls === 1 ? { can_audit: true, problem: "Only this." } : GOOD_NOTE;
+    if (calls === 2) assert.match(JSON.parse(init.body).messages[0].content, /Your last answer was incomplete/);
+    return Response.json({ content: [{ type: "tool_use", name: "free_note", input }] });
+  };
+  let res = await withNet(acmeNet(flaky), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal((await res.json()).note.fix, GOOD_NOTE.fix);
+  assert.equal(calls, 2);
+
+  calls = 0;
+  const never = () => { calls++; return Response.json({ content: [{ type: "tool_use", name: "free_note", input: { can_audit: true } }] }); };
+  res = await withNet(acmeNet(never), () => worker.fetch(post({ url: "acme.com" }), env, {}));
+  assert.equal(res.status, 502);
+  assert.equal(calls, 2, "two tries at most");
+});

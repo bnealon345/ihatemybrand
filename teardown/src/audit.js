@@ -99,11 +99,51 @@ function clean(value, max) {
  * format or switch off the never-invent rule.
  */
 export async function runFreeAudit(page, env, fetchImpl = fetch, customPrompt = "") {
+  const system = (String(customPrompt || "").trim() || AUDITOR_PROMPT) + HOUSE_RULES;
+  const question = buildFreeUserMessage(page);
+
+  // One retry if the answer comes back incomplete. Never more: each try is a paid call.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const nudge = attempt === 1 ? "" :
+      "\n\nYour last answer was incomplete. Call the free_note tool with can_audit, problem, why_its_costing_them and fix all filled in.";
+    const data = await callClaude(env, fetchImpl, system, question + nudge);
+
+    let out = data?.content?.find((block) => block.type === "tool_use")?.input;
+    if (!out) out = jsonFromText(data?.content);
+
+    if (out && typeof out === "object") {
+      if (out.can_audit === false) {
+        throw new TeardownError(
+          "too_little_content",
+          clean(out.reason, 300) || "There isn't enough on that page for an honest audit.",
+        );
+      }
+      const note = {
+        problem: clean(out.problem, 300),
+        why: clean(out.why_its_costing_them ?? out.why, 1200),
+        fix: clean(out.fix, 1500),
+      };
+      if (note.problem && note.why && note.fix) return note;
+    }
+
+    // Shapes only, never the content, so the log shows what went wrong without storing the audit.
+    console.error("Incomplete audit answer", JSON.stringify({
+      attempt,
+      stop_reason: data?.stop_reason,
+      blocks: (data?.content || []).map((b) => b.type),
+      fields: out && typeof out === "object" ? Object.keys(out) : null,
+      output_tokens: data?.usage?.output_tokens,
+    }));
+  }
+  throw new TeardownError("audit_failed", "Our auditor came back with half an answer. Try again in a minute.", 502);
+}
+
+async function callClaude(env, fetchImpl, system, userMessage) {
   let res;
   try {
     res = await fetchImpl("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      signal: AbortSignal.timeout(45_000),
+      signal: AbortSignal.timeout(60_000),
       headers: {
         "content-type": "application/json",
         "x-api-key": env.ANTHROPIC_API_KEY,
@@ -111,46 +151,22 @@ export async function runFreeAudit(page, env, fetchImpl = fetch, customPrompt = 
       },
       body: JSON.stringify({
         model: env.CLAUDE_MODEL || DEFAULT_MODEL,
-        max_tokens: 1024,
-        system: (String(customPrompt || "").trim() || AUDITOR_PROMPT) + HOUSE_RULES,
+        max_tokens: 4096,
+        system,
         tools: [FREE_NOTE_TOOL],
         // This model rejects forced tool use ("tool" and "any"), so it is asked to call the tool in the
-        // system prompt instead, and a plain JSON answer is accepted as a fallback below.
+        // system prompt instead, and a plain JSON answer is accepted as a fallback.
         tool_choice: { type: "auto" },
-        messages: [{ role: "user", content: buildFreeUserMessage(page) }],
+        messages: [{ role: "user", content: userMessage }],
       }),
     });
   } catch {
     throw new TeardownError("audit_failed", "Our auditor didn't answer. Try again in a minute.", 502);
   }
-
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     console.error("Claude API error", res.status, detail.slice(0, 500));
     throw new TeardownError("audit_failed", "Our auditor hit a snag. Try again in a minute.", 502);
   }
-
-  const data = await res.json().catch(() => null);
-  let out = data?.content?.find((block) => block.type === "tool_use")?.input;
-  if (!out) out = jsonFromText(data?.content);
-  if (!out || typeof out !== "object") {
-    throw new TeardownError("audit_failed", "Our auditor came back with nothing usable. Try again in a minute.", 502);
-  }
-
-  if (out.can_audit === false) {
-    throw new TeardownError(
-      "too_little_content",
-      clean(out.reason, 300) || "There isn't enough on that page for an honest audit.",
-    );
-  }
-
-  const note = {
-    problem: clean(out.problem, 300),
-    why: clean(out.why_its_costing_them, 1200),
-    fix: clean(out.fix, 1500),
-  };
-  if (!note.problem || !note.why || !note.fix) {
-    throw new TeardownError("audit_failed", "Our auditor came back with half an answer. Try again in a minute.", 502);
-  }
-  return note;
+  return res.json().catch(() => null);
 }
