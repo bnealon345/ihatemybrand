@@ -49,6 +49,8 @@ nav a.tdn i{font-family:var(--mono);font-style:normal;font-weight:500;font-size:
   .tdb-badge span{font-size:9px;margin-top:5px}
   .tdb form{padding:18px;border-radius:24px;box-shadow:8px 8px 0 var(--navy)}
   .tdb button{width:100%}
+  .tdb-points{flex-direction:column;gap:6px}
+  .tdb-points span[aria-hidden]{display:none}
 }
 `;
 
