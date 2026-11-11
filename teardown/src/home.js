@@ -13,7 +13,9 @@ const CSS = `
 nav a.tdn{display:inline-flex;align-items:center;gap:8px;color:var(--paper);font-weight:700}
 nav a.tdn i{font-family:var(--mono);font-style:normal;font-weight:500;font-size:10px;letter-spacing:.14em;text-transform:uppercase;background:var(--lime);color:var(--navy);padding:3px 7px;border-radius:999px}
 
-.hero h1 .ihmb-thumb{float:left;width:1.53em;height:1.53em;margin:.062em .15em 0 0;background:var(--lime);display:flex;align-items:center;justify-content:center}
+/* The headline is capped a little lower than the main site's 200px so both lines fit beside the thumb. */
+.hero h1{font-size:clamp(72px,13.5vw,176px)}
+.hero h1 .ihmb-thumb{float:left;width:1.61em;height:1.61em;margin:.062em .15em 0 0;background:var(--lime);display:flex;align-items:center;justify-content:center}
 .ihmb-thumb svg{width:78%;height:78%;display:block}
 .ihmb-thumb .thumb{transform-box:view-box;transform-origin:51px 46px;transition:transform .35s cubic-bezier(.3,1.4,.5,1)}
 .hero h1:has(.swap.hov:hover) .ihmb-thumb .thumb{transform:rotate(180deg)}
