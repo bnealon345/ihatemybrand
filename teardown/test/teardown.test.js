@@ -1195,3 +1195,21 @@ test("email copied to the logging address updates the right lead's trail and sta
     "Stage: contacted to replied",
   ]);
 });
+
+test("homepage copy edits apply to the real wording and do nothing once it changes", async () => {
+  const team = `<h3>Brian Nealon</h3><p>Brian's bio.</p><div class="laurels"><span>Other</span></div>
+    <h3>Ned Rossi</h3>
+    <p>Award-winning filmmaker who shoots every brand like it's a feature. His short <i>The Visit</i> won Best Young Director in Milan; <i>Tear Stained Forgiveness</i> took Best Music Video and Audience Choice.</p>
+    <div class="laurels"><span>Best Young Director \u00b7 Reale Film Festival</span><span>Best Music Video \u00b7 GLCFF 2024</span><span>Audience Choice \u00b7 GLCFF 2024</span></div>`;
+  const env = { SITE: { fetch: async () => html(team) } };
+  const out = await (await worker.fetch(new Request("https://ihatemybrand.com/"), env, {})).text();
+
+  assert.ok(out.includes("<p>Award-winning filmmaker with a feature-film eye and zero patience for boring brands. His short film <i>The Visit</i> earned him Best Young Director in Milan. As a working social media manager, he knows what makes people stop, look and care.</p>"));
+  assert.ok(out.includes('<div class="laurels"><span>Best Young Director \u00b7 Reale Film Festival</span><span>Official Selection \u00b7 Phoenix Film Festival</span><span>Official Selection \u00b7 Roma Film Festival</span></div>'));
+  assert.doesNotMatch(out, /GLCFF|Tear Stained|shoots every brand/);
+  assert.ok(out.includes("<p>Brian's bio.</p>") && out.includes("<span>Other</span>"), "nothing else is touched");
+
+  const { applyCopyEdits } = await import("../src/home.js");
+  const already = "<p>Award-winning filmmaker with new words.</p><span>Official Selection</span>";
+  assert.equal(applyCopyEdits(already), already);
+});

@@ -83,6 +83,29 @@ const BAND = `
 </section>
 `;
 
+// Copy changes to the main site's homepage, made here because the main site's files can't be edited
+// from the Cloudflare editor (it is a static upload). Each one only applies while the original
+// wording is still there, so once the main site itself is updated these quietly stop doing anything.
+// When the main site's source is next edited, make the same changes there and delete these.
+const COPY_EDITS = [
+  {
+    // Ned Rossi's bio in the team section.
+    find: /<p>Award-winning filmmaker who shoots every brand[\s\S]*?<\/p>/,
+    replace: "<p>Award-winning filmmaker with a feature-film eye and zero patience for boring brands. His short film <i>The Visit</i> earned him Best Young Director in Milan. As a working social media manager, he knows what makes people stop, look and care.</p>",
+  },
+  {
+    // The two GLCFF tags under his bio. The Best Young Director tag before them is left alone.
+    find: /<span>[^<]*GLCFF[^<]*<\/span>\s*<span>[^<]*GLCFF[^<]*<\/span>/,
+    replace: "<span>Official Selection \u00b7 Phoenix Film Festival</span><span>Official Selection \u00b7 Roma Film Festival</span>",
+  },
+];
+
+export function applyCopyEdits(html) {
+  let out = html;
+  for (const edit of COPY_EDITS) out = out.replace(edit.find, edit.replace);
+  return out;
+}
+
 function isLocal(hostname) {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
 }
@@ -98,7 +121,16 @@ export async function serveHome(request, env, { preview = false } = {}) {
   else res = await fetch(upstream);
 
   const isPage = request.method === "GET" && res.ok && (res.headers.get("content-type") || "").includes("text/html");
-  if (!isPage || typeof HTMLRewriter === "undefined") return res;
+  if (!isPage) return res;
+
+  // The page is small (tens of kilobytes), so it is read whole for the copy edits.
+  const original = await res.text();
+  const edited = applyCopyEdits(original);
+  const headers = new Headers(res.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  res = new Response(edited, { status: res.status, headers });
+  if (typeof HTMLRewriter === "undefined") return res;
 
   const out = new HTMLRewriter()
     .on("head", { element(el) { el.append(`<style>${CSS}</style>`, { html: true }); } })
@@ -108,8 +140,8 @@ export async function serveHome(request, env, { preview = false } = {}) {
     .transform(res);
 
   if (!preview) return out;
-  const headers = new Headers(out.headers);
-  headers.set("x-robots-tag", "noindex, nofollow");
-  headers.set("cache-control", "no-store");
-  return new Response(out.body, { status: out.status, headers });
+  const previewHeaders = new Headers(out.headers);
+  previewHeaders.set("x-robots-tag", "noindex, nofollow");
+  previewHeaders.set("cache-control", "no-store");
+  return new Response(out.body, { status: out.status, headers: previewHeaders });
 }
